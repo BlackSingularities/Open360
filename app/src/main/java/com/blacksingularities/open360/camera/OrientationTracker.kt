@@ -6,22 +6,19 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import com.blacksingularities.open360.math.Quat
+import com.blacksingularities.open360.math.Vec3
 import kotlin.math.max
-
-/** Źródło orientacji: fuzja z magnetometrem (stały kierunek) albo tylko żyroskop i akcelerometr. */
-enum class OrientationSource(val label: String, val detail: String) {
-    GAME("Żyroskop", "Płynny, odporny na metal i magnesy. Dryf koryguje obraz."),
-    ROTATION("Żyroskop + kompas", "Stały kierunek północy, ale wrażliwy na zakłócenia magnetyczne."),
-}
 
 /**
  * Orientacja urządzenia z historią (bufor kołowy), żeby każdej klatce kamery przypisać pozę
- * z chwili naświetlenia – interpolacją sferyczną między próbkami czujnika.
+ * z chwili naświetlenia – interpolacją sferyczną między próbkami czujnika – oraz prędkość
+ * kątową (do odwracania migawki szczelinowej i oceny rozmycia ruchu). Źródłem jest wektor
+ * obrotu bez magnetometru: płynny i odporny na metal; dryf koryguje dopasowanie obrazem.
  */
 class OrientationTracker(context: Context) : SensorEventListener {
     private val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
 
-    private val size = 512
+    private val size = 1024
     private val times = LongArray(size)
     private val quats = arrayOfNulls<Quat>(size)
     private var head = 0
@@ -36,23 +33,14 @@ class OrientationTracker(context: Context) : SensorEventListener {
     @Volatile var latest: Quat? = null
         private set
 
-    var source = OrientationSource.GAME
-        private set
-
     val available: Boolean
         get() = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR) != null ||
             sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) != null
 
-    fun start(src: OrientationSource) {
+    fun start() {
         stop()
-        source = src
-        val type = when (src) {
-            OrientationSource.GAME -> Sensor.TYPE_GAME_ROTATION_VECTOR
-            OrientationSource.ROTATION -> Sensor.TYPE_ROTATION_VECTOR
-        }
-        val sensor = sm.getDefaultSensor(type)
+        val sensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
             ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-            ?: sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
             ?: return
         sm.registerListener(this, sensor, SensorManager.SENSOR_DELAY_FASTEST)
     }
@@ -68,16 +56,18 @@ class OrientationTracker(context: Context) : SensorEventListener {
 
     override fun onSensorChanged(e: SensorEvent) {
         SensorManager.getQuaternionFromVector(q, e.values)
-        val nq = Quat(q[0], q[1], q[2], q[3]).normalized()
+        var nq = Quat(q[0], q[1], q[2], q[3]).normalized()
         synchronized(lock) {
             if (count > 0) {
                 val prevI = (head - 1 + size) % size
+                val prev = quats[prevI]!!
+                // Ta sama orientacja, krótsza droga – ułatwia interpolację.
+                if (prev.dot(nq) < 0f) nq = Quat(-nq.w, -nq.x, -nq.y, -nq.z)
                 val dt = (e.timestamp - times[prevI]) / 1e9f
                 if (dt > 0f) {
-                    val prev = quats[prevI]!!
                     val speed = Math.toDegrees(prev.angleTo(nq).toDouble()).toFloat() / dt
                     // Filtr – odporny na nierówne odstępy próbek.
-                    val a = (dt / 0.08f).coerceIn(0.02f, 1f)
+                    val a = (dt / 0.06f).coerceIn(0.02f, 1f)
                     angularSpeed += (speed.coerceAtMost(720f) - angularSpeed) * a
                 }
             }
@@ -89,17 +79,26 @@ class OrientationTracker(context: Context) : SensorEventListener {
         latest = nq
     }
 
-    /** Poza z chwili [timestampNs] (zegar czujników); null, gdy brak danych z tego okresu. */
+    private fun at(k: Int) = (head - 1 - k + size) % size
+
+    /**
+     * Poza z chwili [timestampNs] (zegar czujników); null, gdy brak danych z tego okresu.
+     * Chwilę po ostatniej próbce (do 40 ms) ekstrapolujemy stałą prędkością kątową.
+     */
     fun poseAt(timestampNs: Long): Quat? = synchronized(lock) {
         if (count == 0) return null
-        var newer = -1
-        for (k in 0 until count) {
-            val i = (head - 1 - k + size) % size
+        val newest = at(0)
+        if (timestampNs >= times[newest]) {
+            val ahead = timestampNs - times[newest]
+            if (ahead > 40_000_000L) return null
+            if (count < 2 || ahead == 0L) return quats[newest]
+            val w = omegaLocked(times[newest]) ?: return quats[newest]
+            return (Quat.fromRotVec(w * (ahead / 1e9f)) * quats[newest]!!).normalized()
+        }
+        var newer = newest
+        for (k in 1 until count) {
+            val i = at(k)
             if (times[i] <= timestampNs) {
-                if (newer < 0) {
-                    // Klatka nowsza niż ostatnia próbka – ekstrapolacja byłaby ryzykowna.
-                    return if (timestampNs - times[i] < 50_000_000L) quats[i] else null
-                }
                 val t0 = times[i]
                 val t1 = times[newer]
                 val t = ((timestampNs - t0).toFloat() / max(1L, t1 - t0)).coerceIn(0f, 1f)
@@ -108,6 +107,24 @@ class OrientationTracker(context: Context) : SensorEventListener {
             newer = i
         }
         null
+    }
+
+    /** Prędkość kątowa (rad/s) w układzie świata w chwili [timestampNs]. */
+    fun omegaAt(timestampNs: Long): Vec3? = synchronized(lock) { omegaLocked(timestampNs) }
+
+    private fun omegaLocked(t: Long): Vec3? {
+        if (count < 2) return null
+        // Różnica między próbkami odległymi o ~16 ms wokół chwili t (mniej szumu niż sąsiednie).
+        var i1 = at(0)
+        var k = 0
+        while (k + 1 < count && times[at(k + 1)] >= t + 8_000_000L) { k++; i1 = at(k) }
+        var j = k + 1
+        var i0 = at(j)
+        while (j + 1 < count && times[i1] - times[i0] < 16_000_000L) { j++; i0 = at(j) }
+        val dt = (times[i1] - times[i0]) / 1e9f
+        if (dt <= 0f || dt > 0.2f) return null
+        val dq = quats[i1]!! * quats[i0]!!.conj()
+        return dq.toRotVec() * (1f / dt)
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit

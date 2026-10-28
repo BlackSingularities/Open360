@@ -1,9 +1,11 @@
 name: Build & Release (Android)
 
-# Budowanie i wydanie wyłącznie po wypchnięciu tagu wersji (np. v1.2.3).
+# Budowanie i wydanie po wypchnięciu tagu wersji (np. v1.2.3) albo na main – wtedy
+# wersja pochodzi z pliku VERSION, a tag v<wersja> zakłada samo wydanie (raz na wersję).
 on:
   push:
     tags: ['v*']
+    branches: ['main']
 
 permissions:
   contents: write
@@ -22,8 +24,18 @@ jobs:
 
       - name: Wersja
         id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then NAME="${GITHUB_REF_NAME#v}"; else NAME="$(tr -d '[:space:]' < VERSION)"; fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NAME" >> "$GITHUB_OUTPUT"
+          # Z gałęzi wydajemy tylko wersję, której jeszcze nie ma.
+          if [ "$GITHUB_REF_TYPE" != "tag" ] && gh release view "v$NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
           echo "code=$(( ${{ github.run_number }} + 100 ))" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
@@ -52,6 +64,7 @@ jobs:
         run: gradle :app:assembleRelease -PversionCode=${{ steps.ver.outputs.code }} -PversionName=${{ steps.ver.outputs.name }} --stacktrace
 
       - name: Publikacja wydania
+        if: steps.ver.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           NAME: ${{ steps.ver.outputs.name }}
@@ -60,7 +73,7 @@ jobs:
           NOTES=$(awk -v version="$NAME" '$0 == "## " version { found=1; next } found && /^## / { exit } found { print }' CHANGELOG.md)
           [ -z "$NOTES" ] && NOTES=$(git log -5 --pretty='- %s')
           FOOTER=$(printf -- '---\n**Android:** pobierz **Open360-%s.apk** i zainstaluj go na telefonie (Android 10+).' "$NAME")
-          gh release create "$GITHUB_REF_NAME" "Open360-$NAME.apk" \
+          gh release create "${{ steps.ver.outputs.tag }}" "Open360-$NAME.apk" \
             --target "$GITHUB_SHA" \
             --title "Open360 $NAME" \
             --notes "$(printf '%s\n\n%s' "$NOTES" "$FOOTER")" \

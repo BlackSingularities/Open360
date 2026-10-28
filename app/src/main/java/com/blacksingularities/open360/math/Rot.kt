@@ -30,6 +30,40 @@ class Mat3(val m: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f))
 
     fun transposed() = Mat3(floatArrayOf(m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]))
 
+    /** Transpozycja razy wektor (dla obrotu – obrót odwrotny) bez tworzenia nowej macierzy. */
+    fun transformT(v: Vec3) = Vec3(
+        m[0] * v.x + m[3] * v.y + m[6] * v.z,
+        m[1] * v.x + m[4] * v.y + m[7] * v.z,
+        m[2] * v.x + m[5] * v.y + m[8] * v.z,
+    )
+
+    /** Wektor obrotu (oś × kąt, rad) – odwrotność [exp]. */
+    fun log(): Vec3 {
+        val tr = m[0] + m[4] + m[8]
+        val c = ((tr - 1f) * 0.5f).coerceIn(-1f, 1f)
+        val a = acos(c)
+        val v = Vec3(m[7] - m[5], m[2] - m[6], m[3] - m[1])
+        if (a < 1e-4f) return v * 0.5f
+        val s = sin(a)
+        if (s < 1e-4f) {
+            // Okolice 180° – oś z przekątnej (w praktyce nie występuje przy korektach).
+            val x = sqrt(((m[0] + 1f) * 0.5f).coerceAtLeast(0f))
+            val y = sqrt(((m[4] + 1f) * 0.5f).coerceAtLeast(0f))
+            val z = sqrt(((m[8] + 1f) * 0.5f).coerceAtLeast(0f))
+            return Vec3(x, y, z).normalized() * a
+        }
+        return v * (a / (2f * s))
+    }
+
+    /** Ortonormalizacja (Gram–Schmidt na wierszach) – usuwa błędy zaokrągleń po wielu złożeniach. */
+    fun orthonormalized(): Mat3 {
+        val r0 = Vec3(m[0], m[1], m[2]).normalized()
+        var r1 = Vec3(m[3], m[4], m[5])
+        r1 = (r1 - r0 * r0.dot(r1)).normalized()
+        val r2 = r0.cross(r1)
+        return Mat3(floatArrayOf(r0.x, r0.y, r0.z, r1.x, r1.y, r1.z, r2.x, r2.y, r2.z))
+    }
+
     /** Kolejność kolumnowa dla glUniformMatrix3fv (transpose = false). */
     fun toGl(out: FloatArray = FloatArray(9)): FloatArray {
         out[0] = m[0]; out[1] = m[3]; out[2] = m[6]
@@ -66,6 +100,13 @@ class Mat3(val m: FloatArray = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f))
                     t * k.x * k.z - s * k.y, t * k.y * k.z + s * k.x, t * k.z * k.z + c,
                 ),
             )
+        }
+
+        /** Obrót o wektor [v] (oś × kąt). */
+        fun exp(v: Vec3): Mat3 {
+            val a = v.length()
+            if (a < 1e-9f) return I
+            return axisAngle(v * (1f / a), a)
         }
 
         /**
@@ -127,10 +168,36 @@ data class Quat(val w: Float, val x: Float, val y: Float, val z: Float) {
 
     fun dot(o: Quat) = w * o.w + x * o.x + y * o.y + z * o.z
 
+    operator fun times(o: Quat) = Quat(
+        w * o.w - x * o.x - y * o.y - z * o.z,
+        w * o.x + x * o.w + y * o.z - z * o.y,
+        w * o.y - x * o.z + y * o.w + z * o.x,
+        w * o.z + x * o.y - y * o.x + z * o.w,
+    )
+
+    fun conj() = Quat(w, -x, -y, -z)
+
+    /** Wektor obrotu (oś × kąt) tego kwaternionu, krótszą drogą. */
+    fun toRotVec(): Vec3 {
+        val q = if (w < 0) Quat(-w, -x, -y, -z) else this
+        val s = sqrt(q.x * q.x + q.y * q.y + q.z * q.z)
+        if (s < 1e-9f) return Vec3(2f * q.x, 2f * q.y, 2f * q.z)
+        val a = 2f * atan2(s, q.w)
+        return Vec3(q.x / s * a, q.y / s * a, q.z / s * a)
+    }
+
     /** Kąt obrotu między orientacjami (rad). */
     fun angleTo(o: Quat): Float = 2f * acos(kotlin.math.abs(dot(o)).coerceAtMost(1f))
 
     companion object {
+        /** Kwaternion z wektora obrotu. */
+        fun fromRotVec(v: Vec3): Quat {
+            val a = v.length()
+            if (a < 1e-9f) return Quat(1f, v.x * 0.5f, v.y * 0.5f, v.z * 0.5f).normalized()
+            val s = sin(a / 2) / a
+            return Quat(cos(a / 2), v.x * s, v.y * s, v.z * s)
+        }
+
         fun slerp(a: Quat, b0: Quat, t: Float): Quat {
             var b = b0
             var d = a.dot(b)
@@ -152,3 +219,27 @@ data class Quat(val w: Float, val x: Float, val y: Float, val z: Float) {
 
 const val DEG = (Math.PI / 180.0).toFloat()
 const val PI_F = Math.PI.toFloat()
+
+/**
+ * Szybkie atan2/asin (wielomian minimaksowy 11. stopnia, błąd < 2·10⁻⁵ rad ≈ 0,001°) –
+ * próbkowanie panoramy robi to setki tysięcy razy na klatkę.
+ */
+object FastMath {
+    fun atan2(y: Float, x: Float): Float {
+        val ax = kotlin.math.abs(x)
+        val ay = kotlin.math.abs(y)
+        if (ax < 1e-30f && ay < 1e-30f) return 0f
+        val swap = ay > ax
+        val t = if (swap) ax / ay else ay / ax
+        val t2 = t * t
+        var r = t * (0.99997726f + t2 * (-0.33262347f + t2 * (0.19354346f + t2 * (-0.11643287f + t2 * (0.05265332f + t2 * -0.01172120f)))))
+        if (swap) r = 1.5707964f - r
+        if (x < 0f) r = 3.1415927f - r
+        return if (y < 0f) -r else r
+    }
+
+    fun asin(z: Float): Float {
+        val c = z.coerceIn(-1f, 1f)
+        return atan2(c, kotlin.math.sqrt(1f - c * c))
+    }
+}

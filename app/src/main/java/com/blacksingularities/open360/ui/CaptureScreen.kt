@@ -45,12 +45,14 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.ViewInAr
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -79,11 +81,11 @@ import com.blacksingularities.open360.camera.CameraInfo
 import com.blacksingularities.open360.camera.OrientationTracker
 import com.blacksingularities.open360.data.CaptureMode
 import com.blacksingularities.open360.data.CaptureRange
-import com.blacksingularities.open360.data.ExportCrop
 import com.blacksingularities.open360.data.Settings
+import com.blacksingularities.open360.export.PanoExporter
 import com.blacksingularities.open360.export.PanoGeometry
 import com.blacksingularities.open360.export.PanoStore
-import com.blacksingularities.open360.gl.ExportRequest
+import com.blacksingularities.open360.gl.CanvasExport
 import com.blacksingularities.open360.gl.PanoRenderer
 import com.blacksingularities.open360.gl.ViewMode
 import com.blacksingularities.open360.gl.ViewState
@@ -108,7 +110,7 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     val tracker = remember { OrientationTracker(context) }
     val engine = remember { CaptureEngine(settings, tracker) }
     val view = remember { ViewState() }
-    val renderer = remember { PanoRenderer(engine, view, settings.canvasWidth) }
+    val renderer = remember { PanoRenderer(engine, view, settings.effectiveCanvas(4096)) }
     val camera = remember { CameraController(context, owner, engine, settings) }
     val sound = remember { MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) } }
 
@@ -120,6 +122,8 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     var confirmExit by remember { mutableStateOf(false) }
     var confirmReset by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
+    var saveProgress by remember { mutableFloatStateOf(0f) }
+    var exportJob by remember { mutableStateOf<CanvasExport?>(null) }
     var showTips by remember { mutableStateOf(!settings.tipsSeen) }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -127,27 +131,39 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     view.mode = mode
     view.grid = settings.showGrid
     view.liveZoomOut = settings.viewZoomOut
-    view.liveAlpha = settings.liveOpacity
+    view.liveAlpha = 0.9f
     view.recording = engine.recording
 
     DisposableEffect(Unit) {
         engine.onRecordingChanged = { camera.setLocked(it) }
         engine.onPointCaptured = {
-            if (settings.haptics) glView?.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-            if (settings.sounds) runCatching { sound.play(MediaActionSound.SHUTTER_CLICK) }
+            if (settings.feedback) {
+                glView?.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                runCatching { sound.play(MediaActionSound.SHUTTER_CLICK) }
+            }
         }
         engine.onAllPointsDone = {
-            if (settings.haptics) glView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            if (settings.feedback) glView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
+        // Za szybko albo rozmazana klatka – krótkie „odrzucenie” w dłoni, bez patrzenia na ekran.
+        engine.onMotionWarning = {
+            if (settings.feedback) {
+                val k = if (android.os.Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.REJECT else HapticFeedbackConstants.LONG_PRESS
+                glView?.performHapticFeedback(k)
+            }
         }
         camera.onInfo = { camInfo = it }
         camera.onError = { error = it }
         renderer.onReady = { maxTex = it }
+        renderer.onCanvasFallback = { w ->
+            Toast.makeText(context, "Za mało pamięci grafiki – panorama w ${w / 1024}K.", Toast.LENGTH_LONG).show()
+        }
         renderer.onContextLost = {
             engine.reset()
             Toast.makeText(context, "Kontekst grafiki został odtworzony – panorama zaczyna się od nowa.", Toast.LENGTH_LONG).show()
         }
         if (!tracker.available) error = "Ten telefon nie ma czujnika orientacji (żyroskopu) – panoramy na żywo nie są możliwe."
-        tracker.start(settings.source)
+        tracker.start()
         camera.start()
         val obs = LifecycleEventObserver { _, e ->
             when (e) {
@@ -158,13 +174,14 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
                 }
                 Lifecycle.Event.ON_RESUME -> {
                     glView?.onResume()
-                    tracker.start(settings.source)
+                    tracker.start()
                 }
                 else -> Unit
             }
         }
         owner.lifecycle.addObserver(obs)
         onDispose {
+            exportJob?.cancelled = true
             owner.lifecycle.removeObserver(obs)
             camera.shutdown()
             tracker.stop()
@@ -180,29 +197,27 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     fun save() {
         if (saving || !engine.hasContent) return
         engine.pause()
-        saving = true
         val cw = engine.canvasW
         val ch = cw / 2
-        val crop = if (settings.crop == ExportCrop.CONTENT) engine.contentBounds(cw, ch) else null
-        val quality = settings.jpegQuality
-        val xmp = settings.writeXmp
-        engine.glCommands += GlCommand.Export(
-            ExportRequest(ExportRequest.Kind.CANVAS, settings.holeFill, crop) { bmp, fullW, fullH ->
-                if (bmp == null) {
-                    saving = false
-                    Toast.makeText(context, "Nie udało się wyeksportować panoramy", Toast.LENGTH_LONG).show()
-                    return@ExportRequest
+        val bounds = engine.contentBounds(cw, ch) ?: return
+        val crop = PanoExporter.crop(bounds, cw, ch)
+        val job = CanvasExport(crop, engine.exportSharpen())
+        saving = true
+        saveProgress = 0f
+        exportJob = job
+        engine.glCommands += GlCommand.Export(job)
+        scope.launch {
+            val geo = PanoGeometry(cw, ch, crop[0], crop[1], crop[2], crop[3])
+            val uri = withContext(Dispatchers.IO) {
+                PanoStore.saveStreaming(context, crop[2], crop[3]) { out ->
+                    PanoExporter.encode(job, out, PanoStore.xmpPayload(geo)) { p -> scope.launch { saveProgress = p } }
                 }
-                scope.launch {
-                    val c = crop ?: intArrayOf(0, 0, fullW, fullH)
-                    val geo = PanoGeometry(fullW, fullH, c[0], c[1], bmp.width, bmp.height)
-                    val uri = withContext(Dispatchers.IO) { PanoStore.save(context, bmp, quality, if (xmp) geo else null) }
-                    bmp.recycle()
-                    saving = false
-                    if (uri != null) onSaved(uri) else Toast.makeText(context, "Nie udało się zapisać pliku", Toast.LENGTH_LONG).show()
-                }
-            },
-        )
+            }
+            if (uri == null) job.cancelled = true
+            exportJob = null
+            saving = false
+            if (uri != null) onSaved(uri) else Toast.makeText(context, "Nie udało się zapisać panoramy", Toast.LENGTH_LONG).show()
+        }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -263,6 +278,9 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
             }
             Spacer(Modifier.height(10.dp))
             StatusBar(engine, settings, camInfo, Modifier.align(Alignment.CenterHorizontally))
+            AnimatedVisibility(engine.recording, Modifier.align(Alignment.CenterHorizontally), enter = fadeIn(), exit = fadeOut()) {
+                SpeedMeter(engine, Modifier.padding(top = 8.dp))
+            }
         }
 
         // Dół: podpowiedź, tryby, spust.
@@ -274,13 +292,15 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
             AnimatedVisibility(hint != Hint.NONE, enter = fadeIn(), exit = fadeOut()) {
                 Text(
                     hint.text,
-                    color = if (hint == Hint.TOO_FAST) Palette.Ink else Color.White,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    fontSize = if (hint.warning) 15.sp else 14.sp,
+                    fontWeight = if (hint.warning) FontWeight.Bold else FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
                     modifier = Modifier
+                        .padding(horizontal = 24.dp)
                         .clip(RoundedCornerShape(50))
-                        .background(if (hint == Hint.TOO_FAST) Color.White else Palette.Scrim)
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                        .background(if (hint.warning) Palette.Record else Palette.Scrim)
+                        .padding(horizontal = 16.dp, vertical = 9.dp),
                 )
             }
             Spacer(Modifier.height(12.dp))
@@ -304,11 +324,11 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    RoundButton(Icons.AutoMirrored.Outlined.Undo, "Cofnij ostatni fragment", enabled = engine.canUndo) { engine.undo() }
+                    RoundButton(Icons.AutoMirrored.Outlined.Undo, "Cofnij ostatni fragment", enabled = engine.canUndo && engine.undoSupported) { engine.undo() }
                     RoundButton(Icons.Outlined.DeleteOutline, "Zacznij od nowa", enabled = engine.hasContent) { confirmReset = true }
                 }
                 Shutter(engine.recording, settings.mode) {
-                    if (settings.haptics) glView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    if (settings.feedback) glView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     engine.toggle()
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -328,7 +348,15 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(color = Color.White)
                     Spacer(Modifier.height(14.dp))
-                    Text("Zapisywanie panoramy…", fontWeight = FontWeight.SemiBold)
+                    Text("Zapisywanie panoramy… ${(saveProgress * 100).roundToInt()}%", fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(10.dp))
+                    LinearProgressIndicator(
+                        progress = { saveProgress },
+                        modifier = Modifier.width(200.dp),
+                        color = Color.White,
+                        trackColor = Palette.PanelHigh,
+                    )
+                    Text("${engine.canvasW / 1024}K · wyostrzanie i wypełnianie dziur", fontSize = 12.sp, color = Palette.TextDim, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }
@@ -370,12 +398,10 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
             settings, camInfo, maxTex,
             object : SettingsEffects {
                 override fun cameraChanged() = camera.bind()
-                override fun gridChanged() = engine.rebuildTargets()
                 override fun canvasChanged() {
-                    renderer.resizeCanvas(settings.canvasWidth)
+                    renderer.resizeCanvas(settings.effectiveCanvas(maxTex))
                     if (!engine.hasContent) engine.reset()
                 }
-                override fun sensorChanged() = tracker.start(settings.source)
                 override fun exposureChanged() {
                     camera.setExposure(settings.exposure)
                     camera.setLocked(engine.recording)
@@ -401,14 +427,60 @@ private fun StatusBar(engine: CaptureEngine, settings: Settings, cam: CameraInfo
         } else {
             Text("${engine.stitched} kl.", style = MonoDigits, color = Palette.TextDim)
         }
-        if (settings.imageAlign && engine.hasContent) {
+        if (engine.rejected > 0) Text("${engine.rejected} odrz.", style = MonoDigits, color = Palette.Record)
+        if (engine.hasContent) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(6.dp).clip(CircleShape).background(if (engine.aligned) Color.White else Palette.TextFaint))
                 Spacer(Modifier.width(4.dp))
-                Text("korekta", fontSize = 12.sp, color = Palette.TextDim)
+                Text("dopasowanie", fontSize = 12.sp, color = Palette.TextDim)
             }
         }
+        Text("${engine.canvasW / 1024}K", style = MonoDigits, color = Palette.TextFaint)
         if (cam != null) Text("${cam.fovH.roundToInt()}°", style = MonoDigits, color = Palette.TextFaint)
+    }
+}
+
+/**
+ * Prędkość obrotu względem limitu wynikającego z czasu naświetlania i rozdzielczości:
+ * biały pasek – w porządku, pomarańczowy – blisko limitu, czerwony – klatki odrzucane.
+ */
+@Composable
+private fun SpeedMeter(engine: CaptureEngine, modifier: Modifier) {
+    val level = engine.blurLevel
+    val color by animateColorAsState(
+        when {
+            level >= 1f -> Palette.Record
+            level >= 0.75f -> Color(0xFFFFB020)
+            else -> Color.White
+        },
+        tween(120), label = "speed",
+    )
+    Column(
+        modifier.clip(RoundedCornerShape(14.dp)).background(Palette.Scrim).padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                when {
+                    level >= 1f -> "Za szybko"
+                    level >= 0.75f -> "Blisko limitu"
+                    else -> "Tempo dobre"
+                },
+                fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = color,
+            )
+            Spacer(Modifier.width(10.dp))
+            Text("${engine.speed.roundToInt()}°/s · limit ${engine.speedLimit.roundToInt()}°/s", style = MonoDigits, color = Palette.TextDim, fontSize = 12.sp)
+        }
+        Spacer(Modifier.height(6.dp))
+        Canvas(Modifier.width(180.dp).height(6.dp)) {
+            val r = size.height / 2
+            drawRoundRect(Color.White.copy(alpha = 0.18f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(r))
+            // Skala do 1,5× limitu; kreska oznacza limit.
+            val f = (level / 1.5f).coerceIn(0f, 1f)
+            drawRoundRect(color, size = size.copy(width = size.width * f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(r))
+            val x = size.width / 1.5f
+            drawLine(Color.White, Offset(x, -2f), Offset(x, size.height + 2f), 2.dp.toPx())
+        }
     }
 }
 
@@ -503,7 +575,7 @@ private fun OverlayLayer(engine: CaptureEngine, view: ViewState, settings: Setti
             }
         }
         // Poziomica: linia przechyłu i pochylenie względem horyzontu.
-        if (settings.showLevel && mode == ViewMode.LIVE) {
+        if (mode == ViewMode.LIVE) {
             val right = m.transform(Vec3(1f, 0f, 0f))
             val roll = -kotlin.math.asin(right.z.coerceIn(-1f, 1f))
             val c = Offset(w / 2, h / 2)
@@ -534,7 +606,7 @@ private fun TipsCard(modifier: Modifier, onDismiss: () -> Unit) {
         Spacer(Modifier.height(12.dp))
         val tips = listOf(
             "Obracaj telefon wokół obiektywu, nie wokół siebie – trzymaj go blisko, łokcie przy ciele.",
-            "Ruszaj się powoli i płynnie. Zbyt szybki ruch jest pomijany.",
+            "Ruszaj się powoli i płynnie. Pasek tempa u góry pokazuje limit – rozmazane klatki są odrzucane, a telefon zawibruje, gdy jest za szybko.",
             "Zacznij od horyzontu, potem niebo i ziemia. Wszystko widać na żywo – dopełniaj puste miejsca.",
             "Tryb „Punkty” prowadzi po siatce i robi zdjęcie sam, gdy kadr jest nieruchomy.",
             "Nie musisz robić całej sfery – zapisz w dowolnej chwili.",

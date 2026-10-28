@@ -1,9 +1,36 @@
 # Zmiany
 
-## 1.2.0
+## 2.1.0
 
+- Domyślnie panorama 8K i klatki 1440p.
+- Limit prędkości obrotu nigdy poniżej 3°/s – drżenie ręki nie odrzuca już klatek przy słabym świetle i dużych rozdzielczościach.
 - Open360 jako źródło plików: gdy przeglądarka lub inna aplikacja prosi o wybranie zdjęcia (np. przy przesyłaniu na stronę), można wskazać zapisaną panoramę albo od razu zrobić nową – trafi prosto do tej aplikacji.
 - Aktualizacje pobierają się w aplikacji (z paskiem postępu) i od razu otwierają instalator – bez przechodzenia do GitHuba w przeglądarce.
+- Z ustawień zniknęła lista funkcji działających automatycznie.
+- Wydanie zawiera jeden plik: Open360-<wersja>.apk.
+
+## 2.0.0
+
+**Ostrzej i czyściej**
+- Rozmazane klatki nie trafiają do panoramy: rozmycie liczone z prędkości obrotu × czasu naświetlania (w pikselach panoramy) oraz mierzone w samym obrazie – klatka mniej ostra niż to, co już zszyte w tym miejscu, jest odrzucana (łapie też nieostrość i drgania, których żyroskop nie widzi).
+- Ostrzeżenia o zbyt szybkim ruchu: pasek tempa z limitem prędkości (biały / pomarańczowy / czerwony), czerwony komunikat „Za szybko!”, informacja o odrzuconej klatce i krótka wibracja ostrzegawcza; licznik odrzuconych klatek.
+- Na czas zbierania krótszy czas naświetlania przy wyższej czułości (ta sama jasność) – mniej rozmycia; ostrość zablokowana, stabilizacja optyczna wyłączona.
+- Dokładne dopasowanie każdej zszywanej klatki metodą Gaussa-Newtona na sferze (obrót 3D, skala ogniskowej, fotometria, wagi Hubera) – dokładność ułamka piksela zamiast kroku 0,25°.
+- Korekta migawki szczelinowej (rolling shutter) i poza z chwili środka naświetlania.
+- Nowe szwy: każdy fragment z klatki, w której był najbliżej środka kadru, z wąskim pasem przenikania; przy ruchomych obiektach przejście ostre zamiast „duchów”. Ostrzejsza klatka wypiera rozmytą.
+- Klatki kluczowe zamiast zszywania wszystkiego: mniej szwów i mniej okazji do rozmycia.
+- Klatki z kamery mipmapowane i filtrowane anizotropowo – bez schodków i migotania przy mniejszych panoramach.
+- Wyrównanie ekspozycji w świetle liniowym, samouczące się winietowanie, samokalibracja kąta widzenia i opóźnienia czujnika.
+- Zapis: wypełnianie dziur metodą push-pull (gładko, bez bloków) i delikatne, adaptacyjne wyostrzanie.
+
+**Większe**
+- Panoramy 16K (16384 × 8192, 134 Mpx) na telefonach z co najmniej ~6 GB pamięci – płótno w kafelkach, zapis strumieniowy wielowątkowym koderem JPEG.
+- Klatki do 2560p; domyślnie rozdzielczość klatek dobierana do rozdzielczości panoramy.
+- Klatki YUV prosto z aparatu (konwersja na GPU) – mniej pracy procesora przy dużych klatkach.
+- Mniejsze zużycie pamięci grafiki (bez drugiej kopii płótna).
+
+**Prościej**
+- Ustawienia skrócone do: rozdzielczość panoramy, rozdzielczość klatek, kompensacja ekspozycji, obiektyw szerokokątny, dźwięk i wibracje, aktualizacje. Reszta dobiera się sama.
 
 ## 1.1.0
 

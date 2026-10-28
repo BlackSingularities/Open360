@@ -1,8 +1,9 @@
 package com.blacksingularities.open360.gl
 
 /**
- * Shadery GLSL ES 3.00. Płótno panoramy jest równoprostokątne: t = 0 to zenit (góra obrazu),
+ * Shadery GLSL ES 3.00. Płótno panoramy jest równoprostokątne: wiersz 0 to zenit (góra obrazu),
  * s = 0 to długość −180°. Kierunki w układzie panoramy: X – wschód, Y – przód, Z – zenit.
+ * Płótno może być podzielone na kafelki (16K) – shadery pracują na globalnych pikselach.
  */
 object Shaders {
     val VERTEX = """#version 300 es
@@ -40,62 +41,92 @@ vec3 camProject(mat3 panoToCam, vec2 camTan, vec3 d) {
     vec2 p = (c.xy / -c.z) / camTan;
     return vec3(p, -1.0);
 }
+// Kamera daje YUV (BT.601, pełny zakres) – zamiana na RGB na GPU zamiast na CPU.
+vec3 yuv2rgb(float y, vec2 c) {
+    float u = c.x - 0.5;
+    float v = c.y - 0.5;
+    return clamp(vec3(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u), 0.0, 1.0);
+}
 """
 
     /**
-     * Zszywanie: każdy piksel płótna w zakresie klatki łączy dotychczasowy kolor z kolorem
-     * z kamery. Kanał alfa przechowuje wagę (odległość od brzegu kadru – jak w OpenPano).
+     * Zszywanie fragmentu płótna (kafelek → bufor roboczy). Reguła łączenia jak w
+     * stitch/FrameModel.kt (Blend): waga = centralność × jakość klatki; nowa klatka wygrywa
+     * tam, gdzie jej waga jest większa, z wąskim pasem przenikania; przy dużej różnicy treści
+     * przejście jest ostre, żeby nie było duchów. Korekta jasności liniowo, migawka szczelinowa
+     * odwracana przez prędkość kątową, próbkowanie kamery z mipmap (bez schodków przy 2K–4K).
      */
     val STITCH = """#version 300 es
 precision highp float;
-in vec2 vUv;
 out vec4 outColor;
-uniform sampler2D uCanvas;
-uniform sampler2D uCam;
+uniform sampler2D uTile;
+uniform sampler2D uY;
+uniform sampler2D uU;
+uniform sampler2D uV;
 uniform mat3 uPanoToCam;
 uniform vec2 uCamTan;
 uniform int uCamRot;
+uniform vec2 uOrigin;
+uniform vec2 uTileOrigin;
 uniform vec2 uCanvasSize;
-uniform int uBlend;
-uniform float uFeather;
 uniform float uGain;
 uniform float uVignette;
+uniform vec3 uOmega;
+uniform float uSkew;
+uniform float uQuality;
 $COMMON
+const float BAND = 0.1;
+const float GHOST = 0.08;
 void main() {
-    vec2 uv = gl_FragCoord.xy / uCanvasSize;
-    vec4 old = texture(uCanvas, uv);
-    vec3 p = camProject(uPanoToCam, uCamTan, dirFromUv(uv));
-    if (p.z > 0.0 || abs(p.x) >= 1.0 || abs(p.y) >= 1.0) { outColor = old; return; }
-    vec2 cuv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
-    vec3 c = texture(uCam, camUv(cuv, uCamRot)).rgb;
-    float r2 = dot(p.xy, p.xy) * 0.5;
-    c *= (1.0 + uVignette * r2) * uGain;
-    c = clamp(c, 0.0, 1.0);
-    float e = 1.0 - max(abs(p.x), abs(p.y));
-    float w = clamp(e / max(uFeather, 0.02), 0.0, 1.0);
-    w = max(w, 1.0 / 255.0);
-    vec3 col;
-    float a;
-    if (uBlend == 1) {
-        // Miękkie przenikanie (średnia ważona).
-        float tot = old.a + w;
-        col = (old.rgb * old.a + c * w) / tot;
-        a = min(1.0, tot);
-    } else if (uBlend == 0) {
-        // Najostrzejsza: wygrywa klatka, w której piksel był bliżej środka kadru.
-        float t = clamp((w - old.a) * 6.0, 0.0, 1.0);
-        col = mix(old.rgb, c, t);
-        a = max(old.a, w);
-    } else if (uBlend == 2) {
-        // Tylko puste miejsca.
-        float t = old.a < 0.004 ? 1.0 : w * (1.0 - old.a);
-        col = mix(old.rgb, c, t);
-        a = max(old.a, w);
-    } else {
-        col = mix(old.rgb, c, w);
-        a = max(old.a, w);
+    vec2 gpx = gl_FragCoord.xy + uOrigin;
+    vec4 old = texelFetch(uTile, ivec2(gpx - uTileOrigin), 0);
+    vec3 c = uPanoToCam * dirFromUv(gpx / uCanvasSize);
+    vec2 p = (c.xy / -min(c.z, -1e-4)) / uCamTan;
+    vec2 b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
+    // Wiersz odczytywany τ s od środka klatki widział świat obrócony o ω·τ.
+    vec3 c2 = c - ((b.y - 0.5) * uSkew) * cross(uOmega, c);
+    p = (c2.xy / -min(c2.z, -1e-4)) / uCamTan;
+    b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
+    vec2 bx = dFdx(b);
+    vec2 by = dFdy(b);
+    if (c.z > -1e-4 || c2.z > -1e-4 || abs(p.x) >= 1.0 || abs(p.y) >= 1.0) { outColor = old; return; }
+    vec3 rgb = yuv2rgb(textureGrad(uY, b, bx, by).r, vec2(textureGrad(uU, b, bx, by).r, textureGrad(uV, b, bx, by).r));
+    vec2 tn = p * uCamTan;
+    float r2 = dot(tn, tn) / dot(uCamTan, uCamTan);
+    vec3 lin = pow(rgb, vec3(2.2)) * (uGain * (1.0 + uVignette * r2));
+    rgb = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
+    float wN = max((1.0 - p.x * p.x) * (1.0 - p.y * p.y) * uQuality, 1.0 / 255.0);
+    float t = 1.0;
+    if (old.a > 0.0) {
+        t = clamp((wN - old.a) / BAND + 0.5, 0.0, 1.0);
+        float diff = abs(dot(rgb - old.rgb, vec3(0.299, 0.587, 0.114)));
+        if (diff > GHOST) t = smoothstep(0.35, 0.65, t);
     }
-    outColor = vec4(col, a);
+    outColor = vec4(mix(old.rgb, rgb, t), mix(old.a, wN, t));
+}
+"""
+
+    /** Pomniejszenie kafelka do podglądu (średnia z bloku, puste piksele nie przyciemniają). */
+    val DOWN = """#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTile;
+uniform vec2 uTileOrigin;
+uniform int uFactor;
+void main() {
+    ivec2 base = ivec2(floor(gl_FragCoord.xy)) * uFactor - ivec2(uTileOrigin);
+    vec3 acc = vec3(0.0);
+    float n = 0.0;
+    float a = 0.0;
+    for (int j = 0; j < uFactor; j++) for (int i = 0; i < uFactor; i++) {
+        vec4 s = texelFetch(uTile, base + ivec2(i, j), 0);
+        float p = s.a > 0.0 ? 1.0 : 0.0;
+        acc += s.rgb * p;
+        n += p;
+        a += s.a;
+    }
+    float k = float(uFactor * uFactor);
+    outColor = n > 0.0 ? vec4(acc / n, max(a / k, 1.0 / 255.0)) : vec4(0.0);
 }
 """
 
@@ -114,7 +145,9 @@ uniform vec4 uCrop;
 uniform bool uGrid;
 uniform bool uFlipY;
 uniform bool uHasCam;
-uniform sampler2D uCam;
+uniform sampler2D uY;
+uniform sampler2D uU;
+uniform sampler2D uV;
 uniform mat3 uPanoToCam;
 uniform vec2 uCamTan;
 uniform int uCamRot;
@@ -158,13 +191,14 @@ void main() {
     vec3 col = background(d);
     if (cuv.x >= 0.0 && cuv.x <= 1.0 && cuv.y >= 0.0 && cuv.y <= 1.0) {
         vec4 s = textureLod(uPano, cuv, uLod);
-        col = mix(col, s.rgb, smoothstep(0.0, 0.05, s.a));
+        col = mix(col, s.rgb, smoothstep(0.0, 2.0 / 255.0, s.a));
     }
     vec3 p = camProject(uPanoToCam, uCamTan, d);
     float m = (uHasCam && p.z < 0.0) ? max(abs(p.x), abs(p.y)) : 10.0;
     float fw = min(fwidth(m), 0.05) * 2.2;
     if (m < 1.0) {
-        vec3 c = texture(uCam, camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot)).rgb;
+        vec2 b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
+        vec3 c = yuv2rgb(textureLod(uY, b, 0.0).r, vec2(textureLod(uU, b, 0.0).r, textureLod(uV, b, 0.0).r));
         col = mix(col, c, uLiveAlpha);
     }
     if (m < 2.0) {
@@ -175,7 +209,7 @@ void main() {
 }
 """
 
-    /** Kopia płótna z wagą przemnożoną – źródło piramidy do wypełniania dziur. */
+    /** Źródło piramidy do wypełniania dziur: kolor z wagą obecności (0/1). */
     val PREMUL = """#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -183,43 +217,59 @@ out vec4 outColor;
 uniform sampler2D uCanvas;
 void main() {
     vec4 c = texture(uCanvas, vUv);
-    float a = smoothstep(0.0, 0.05, c.a);
+    float a = smoothstep(0.0, 1.0 / 255.0, c.a);
     outColor = vec4(c.rgb * a, a);
 }
 """
 
-    /** Eksport pasami: kadr płótna + wypełnienie dziur (rozmyte z piramidy albo kolorem). */
+    /**
+     * Eksport fragmentu kafelka: wypełnianie dziur metodą push-pull (od najgrubszego poziomu
+     * piramidy do najdrobniejszego – gładko, bez bloków) i delikatne wyostrzanie (maska
+     * nieostra 3×3 na luminancji z progiem, żeby nie wzmacniać szumu).
+     */
     val EXPORT = """#version 300 es
 precision highp float;
 out vec4 outColor;
-uniform sampler2D uCanvas;
+uniform sampler2D uTile;
 uniform sampler2D uFill;
-uniform int uFillMode;
-uniform vec3 uFillColor;
-uniform vec2 uFullSize;
-uniform vec2 uOffset;
+uniform vec2 uOrigin;
+uniform vec2 uTileOrigin;
+uniform vec2 uCanvasSize;
 uniform float uMaxLod;
-void main() {
-    vec2 px = gl_FragCoord.xy + uOffset;
-    vec2 uv = px / uFullSize;
-    uv.x = fract(uv.x);
-    vec4 c = texture(uCanvas, uv);
-    vec3 fill = uFillColor;
-    if (uFillMode == 0) {
-        for (float lod = 1.0; lod <= 12.0; lod += 1.0) {
-            if (lod > uMaxLod) break;
-            vec4 f = textureLod(uFill, uv, lod);
-            if (f.a > 0.04) {
-                vec4 f2 = textureLod(uFill, uv, min(lod + 1.0, uMaxLod));
-                vec3 a = f.rgb / f.a;
-                vec3 b = f2.a > 0.0 ? f2.rgb / f2.a : a;
-                fill = mix(a, b, 0.5);
-                break;
-            }
+uniform float uSharpen;
+vec3 fillAt(vec2 uv) {
+    vec3 acc = vec3(0.5);
+    bool have = false;
+    for (int k = 0; k <= 13; k++) {
+        float lod = uMaxLod - float(k);
+        if (lod < 0.0) break;
+        vec4 f = textureLod(uFill, uv, lod);
+        if (f.a > 0.002) {
+            vec3 c = f.rgb / f.a;
+            acc = have ? mix(acc, c, smoothstep(0.0, 1.0, f.a)) : c;
+            have = true;
         }
     }
-    float a = smoothstep(0.0, 0.05, c.a);
-    outColor = vec4(mix(fill, c.rgb, a), 1.0);
+    return acc;
+}
+void main() {
+    vec2 g = gl_FragCoord.xy + uOrigin;
+    ivec2 t = ivec2(g - uTileOrigin);
+    ivec2 lim = textureSize(uTile, 0) - 1;
+    vec4 c = texelFetch(uTile, t, 0);
+    if (c.a <= 0.0) { outColor = vec4(fillAt(g / uCanvasSize), 1.0); return; }
+    vec3 blur = c.rgb * 4.0;
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        if (i == 0 && j == 0) continue;
+        vec4 n = texelFetch(uTile, clamp(t + ivec2(i, j), ivec2(0), lim), 0);
+        float w = (i == 0 || j == 0) ? 2.0 : 1.0;
+        blur += (n.a > 0.0 ? n.rgb : c.rgb) * w;
+    }
+    blur /= 16.0;
+    vec3 detail = c.rgb - blur;
+    float dl = abs(dot(detail, vec3(0.299, 0.587, 0.114)));
+    float k = uSharpen * smoothstep(0.004, 0.02, dl);
+    outColor = vec4(clamp(c.rgb + k * detail, 0.0, 1.0), 1.0);
 }
 """
 }

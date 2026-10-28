@@ -64,6 +64,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.blacksingularities.open360.camera.OrientationTracker
 import com.blacksingularities.open360.data.Settings
+import com.blacksingularities.open360.export.PanoExporter
 import com.blacksingularities.open360.export.PanoGeometry
 import com.blacksingularities.open360.export.PanoStore
 import com.blacksingularities.open360.gl.ExportRequest
@@ -116,7 +117,7 @@ fun ViewerScreen(settings: Settings, uri: Uri, ownFile: Boolean, onClose: () -> 
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
                     glView?.onResume()
-                    if (gyro) tracker.start(settings.source)
+                    if (gyro) tracker.start()
                 }
                 else -> Unit
             }
@@ -142,8 +143,9 @@ fun ViewerScreen(settings: Settings, uri: Uri, ownFile: Boolean, onClose: () -> 
     }
 
     LaunchedEffect(gyro) {
+        settings.viewerGyro = gyro
         if (gyro) {
-            tracker.start(settings.source)
+            tracker.start()
         } else {
             tracker.stop()
             view.sensorView = null
@@ -284,7 +286,10 @@ fun ViewerScreen(settings: Settings, uri: Uri, ownFile: Boolean, onClose: () -> 
                 Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     RoundButton(Icons.Outlined.Explore, "Rozglądanie telefonem", active = gyro, enabled = mode == ViewMode.PERSPECTIVE) { gyro = !gyro }
-                    RoundButton(Icons.Outlined.Sync, "Automatyczny obrót", active = spin) { spin = !spin }
+                    RoundButton(Icons.Outlined.Sync, "Automatyczny obrót", active = spin) {
+                        spin = !spin
+                        settings.autoRotate = spin
+                    }
                     RoundButton(Icons.Outlined.Vrpano, "Tryb gogli VR", active = vr, enabled = mode == ViewMode.PERSPECTIVE) {
                         vr = !vr
                         if (vr) {
@@ -296,7 +301,7 @@ fun ViewerScreen(settings: Settings, uri: Uri, ownFile: Boolean, onClose: () -> 
                         exporting = true
                         val size = if (mode == ViewMode.FLAT) 4096 else 2048
                         renderer.requestViewExport(
-                            ExportRequest(ExportRequest.Kind.VIEW, size = size, mode = mode) { bmp, _, _ ->
+                            ExportRequest(size = size, mode = mode) { bmp ->
                                 if (bmp == null) {
                                     exporting = false
                                     return@ExportRequest
@@ -308,7 +313,7 @@ fun ViewerScreen(settings: Settings, uri: Uri, ownFile: Boolean, onClose: () -> 
                                         ViewMode.FLAT -> "MAP"
                                         else -> "VIEW"
                                     }
-                                    val saved = withContext(Dispatchers.IO) { PanoStore.save(context, bmp, settings.jpegQuality, null, prefix) }
+                                    val saved = withContext(Dispatchers.IO) { PanoStore.save(context, bmp, PanoExporter.QUALITY, null, prefix) }
                                     bmp.recycle()
                                     exporting = false
                                     Toast.makeText(

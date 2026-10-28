@@ -226,7 +226,7 @@ fun HomeScreen(
     }
 
     if (showSettings) {
-        SettingsSheet(settings, null, 8192, object : SettingsEffects {}) { showSettings = false }
+        SettingsSheet(settings, null, 4096, object : SettingsEffects {}) { showSettings = false }
     }
 }
 
