@@ -1,5 +1,10 @@
 # Zmiany
 
+## 2.2.0
+
+- Naprawione „domykanie się” koła za wcześnie przy obracaniu się w miejscu z telefonem w ręce: dopasowanie obrazem sumowało paralaksę bliskich przedmiotów (aparat porusza się po okręgu), więc panorama „myślała”, że obrót jest o kilkanaście procent większy, i nakładała obraz z początku zbyt wcześnie. Teraz położenie klatek wyznacza żyroskop, a obraz poprawia tylko jego powolny dryf i drobne lokalne przesunięcia.
+- Kąt widzenia z faktycznej ogniskowej aparatu (telefony z kilkoma obiektywami podawały listę ogniskowych), bez samokalibracji z obrazu, która mogła utrwalić błędną skalę.
+
 ## 2.1.0
 
 - Domyślnie panorama 8K i klatki 1440p.

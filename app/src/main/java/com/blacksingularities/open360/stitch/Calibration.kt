@@ -1,8 +1,8 @@
 package com.blacksingularities.open360.stitch
 
+import com.blacksingularities.open360.math.DEG
 import com.blacksingularities.open360.math.Mat3
 import com.blacksingularities.open360.math.Vec3
-import kotlin.math.abs
 
 /**
  * Samouczące się winietowanie: w zakładkach porównujemy jasność klatki z tym, co już zszyte,
@@ -80,22 +80,50 @@ class SyncEstimator {
     }
 }
 
-/** Uśrednianie poprawek kąta widzenia z kolejnych klatek (mnożnik danych producenta). */
-class FovEstimator {
-    var scale = 1f
+/**
+ * Korekta pozy obrazem bez narastania błędu. Dopasowanie klatki do panoramy mierzy „obrót
+ * pozorny”: przy obracaniu się z telefonem w wyciągniętej ręce aparat także się przesuwa,
+ * a bliskie przedmioty przesuwają się w kadrze bardziej niż sam obrót (paralaksa, przy ramieniu
+ * 40 cm i ścianie 3 m – o ~13%). Gdyby każdą klatkę stawiać tam, gdzie wskazuje obraz, błąd
+ * sumowałby się klatka po klatce i koło „zamykałoby się” po ~315°. Dlatego globalną
+ * geometrię wyznacza żyroskop, a obraz:
+ *  - koryguje jego powolny dryf – korekta [corr] goni pomiar najwyżej [RATE] na sekundę
+ *    i nie przekracza [MAX],
+ *  - dosuwa pojedynczą klatkę lokalnie najwyżej o [LOCAL] (opóźnienia, drgania),
+ *    co nie przenosi się na kolejne klatki.
+ */
+class PoseCorrector {
+    @Volatile var corr = Mat3.I
         private set
-    private var n = 0
 
-    fun reset(s: Float = 1f) {
-        scale = s
-        n = 0
+    fun reset(c: Mat3 = Mat3.I) {
+        corr = c
     }
 
-    fun add(frameScale: Float, ncc: Float) {
-        if (ncc < 0.8f || abs(frameScale - 1f) < 1e-5f) return
-        n++
-        val rate = if (n < 10) 0.25f else 0.1f
-        scale = (scale * (1f + rate * (frameScale - 1f))).coerceIn(0.88f, 1.12f)
+    /** [deviation] – poza z obrazu względem żyroskopu (obraz · żyroskopᵀ), [dt] – czas od poprzedniego pomiaru. */
+    fun update(deviation: Mat3, dt: Float) {
+        val step = (deviation * corr.transposed()).log()
+        val maxStep = RATE * dt.coerceIn(0f, 0.25f)
+        val l = step.length()
+        val applied = if (l > maxStep) step * (maxStep / l) else step
+        var next = (Mat3.exp(applied) * corr).orthonormalized()
+        val total = next.log()
+        if (total.length() > MAX) next = Mat3.exp(total * (MAX / total.length()))
+        corr = next
+    }
+
+    /** Poza do zszycia: żyroskop z korektą dryfu i ograniczonym lokalnym dosunięciem do obrazu. */
+    fun stitchPose(deviation: Mat3, gyroPose: Mat3): Mat3 {
+        val local = (deviation * corr.transposed()).log()
+        val l = local.length()
+        val bounded = if (l > LOCAL) local * (LOCAL / l) else local
+        return (Mat3.exp(bounded) * corr * gyroPose).orthonormalized()
+    }
+
+    companion object {
+        val RATE = 0.15f * DEG
+        val MAX = 6f * DEG
+        val LOCAL = 0.35f * DEG
     }
 }
 

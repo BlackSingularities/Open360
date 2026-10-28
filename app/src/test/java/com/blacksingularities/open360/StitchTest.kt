@@ -6,7 +6,7 @@ import com.blacksingularities.open360.math.Vec3
 import com.blacksingularities.open360.stitch.AlignResult
 import com.blacksingularities.open360.stitch.Aligner
 import com.blacksingularities.open360.stitch.Blend
-import com.blacksingularities.open360.stitch.FovEstimator
+import com.blacksingularities.open360.stitch.PoseCorrector
 import com.blacksingularities.open360.stitch.FrameGeom
 import com.blacksingularities.open360.stitch.Gamma
 import com.blacksingularities.open360.stitch.GrayCanvas
@@ -151,18 +151,43 @@ class StitchTest {
         val geom = FrameGeom(tanX, tanY)
         val fine = GrayCanvas(3600, 1800)
         reference(fine, geom, 640)
-        // Prawdziwy kąt widzenia o 3% szerszy niż deklarowany.
+        // Prawdziwy kąt widzenia o 3% szerszy niż deklarowany – pojedyncza klatka to wykrywa.
         val wide = FrameGeom(tanX * 1.03f, tanY * 1.03f)
-        val est = FovEstimator()
         val truth = pose(5f, -4f)
         val fg = render(truth, wide, 600)
+        var s = 1f
         repeat(12) {
-            val g = geom.withTan(tanX * est.scale, tanY * est.scale)
-            val r = Aligner.refine(fine, SampleSet.textured(fg, 6, 3000), g, truth, estimateFov = true)
-            est.add(r.fovScale, r.ncc)
+            val r = Aligner.refine(fine, SampleSet.textured(fg, 6, 3000), geom.withTan(tanX * s, tanY * s), truth, estimateFov = true)
+            if (r.status == AlignResult.Status.OK) s *= r.fovScale
         }
-        println("fov scale=${est.scale}")
-        assertEquals(1.03f, est.scale, 0.006f)
+        println("fov scale=$s")
+        assertEquals(1.03f, s, 0.006f)
+    }
+
+    @Test
+    fun imageCorrectionDoesNotAccumulate() {
+        // Obrót w miejscu z telefonem w ręce: obraz pokazuje o 13% większy obrót niż żyroskop.
+        val pc = PoseCorrector()
+        var worst = 0f
+        var yaw = 0f
+        for (k in 0 until 300) {
+            yaw += 1.2f * DEG // 30°/s, klatka co 40 ms
+            val gyro = Mat3.rotZ(yaw)
+            // Klatka dopasowana do sąsiadów wskazuje pozę przesuniętą o paralaksę względem
+            // tego, gdzie leżą sąsiedzi (a ci leżą tam, gdzie postawiła ich korekta).
+            val placedNeighbour = pc.corr * Mat3.rotZ(yaw - 4f * DEG)
+            val image = Mat3.rotZ(4f * DEG * 1.13f) * placedNeighbour
+            val stitched = pc.stitchPose(image * gyro.transposed(), gyro)
+            pc.update(image * gyro.transposed(), 0.04f)
+            worst = maxOf(worst, (stitched * gyro.transposed()).log().length() / DEG)
+        }
+        println("max odchylenie od żyroskopu po 360°: $worst°")
+        // Bez ograniczenia byłoby ~47°.
+        assertTrue(worst < 2.5f)
+        // Prawdziwy dryf żyroskopu (stałe 2°) korekta jednak przyjmuje.
+        val drift = Mat3.rotZ(2f * DEG)
+        repeat(400) { pc.update(drift, 0.05f) }
+        assertEquals(2f, pc.corr.log().length() / DEG, 0.05f)
     }
 
     @Test
