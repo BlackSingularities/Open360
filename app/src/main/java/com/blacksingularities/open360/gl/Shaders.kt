@@ -26,6 +26,13 @@ vec2 uvFromDir(vec3 d) {
     float lat = asin(clamp(d.z, -1.0, 1.0));
     return vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);
 }
+// Współrzędne obrazu pionowego (y w dół) → współrzędne bufora kamery obróconego o rot°.
+vec2 camUv(vec2 uv, int rot) {
+    if (rot == 90) return vec2(uv.y, 1.0 - uv.x);
+    if (rot == 180) return vec2(1.0 - uv.x, 1.0 - uv.y);
+    if (rot == 270) return vec2(1.0 - uv.y, uv.x);
+    return uv;
+}
 // Kierunek panoramy → współrzędne kadru kamery (−1..1, y w górę); z > 0 – za kamerą.
 vec3 camProject(mat3 panoToCam, vec2 camTan, vec3 d) {
     vec3 c = panoToCam * d;
@@ -47,6 +54,7 @@ uniform sampler2D uCanvas;
 uniform sampler2D uCam;
 uniform mat3 uPanoToCam;
 uniform vec2 uCamTan;
+uniform int uCamRot;
 uniform vec2 uCanvasSize;
 uniform int uBlend;
 uniform float uFeather;
@@ -59,7 +67,7 @@ void main() {
     vec3 p = camProject(uPanoToCam, uCamTan, dirFromUv(uv));
     if (p.z > 0.0 || abs(p.x) >= 1.0 || abs(p.y) >= 1.0) { outColor = old; return; }
     vec2 cuv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
-    vec3 c = texture(uCam, cuv).rgb;
+    vec3 c = texture(uCam, camUv(cuv, uCamRot)).rgb;
     float r2 = dot(p.xy, p.xy) * 0.5;
     c *= (1.0 + uVignette * r2) * uGain;
     c = clamp(c, 0.0, 1.0);
@@ -109,6 +117,7 @@ uniform bool uHasCam;
 uniform sampler2D uCam;
 uniform mat3 uPanoToCam;
 uniform vec2 uCamTan;
+uniform int uCamRot;
 uniform float uLiveAlpha;
 uniform vec4 uFrameColor;
 $COMMON
@@ -155,7 +164,7 @@ void main() {
     float m = (uHasCam && p.z < 0.0) ? max(abs(p.x), abs(p.y)) : 10.0;
     float fw = min(fwidth(m), 0.05) * 2.2;
     if (m < 1.0) {
-        vec3 c = texture(uCam, vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5)).rgb;
+        vec3 c = texture(uCam, camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot)).rgb;
         col = mix(col, c, uLiveAlpha);
     }
     if (m < 2.0) {

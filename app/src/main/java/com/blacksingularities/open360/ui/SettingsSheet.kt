@@ -69,6 +69,7 @@ fun SettingsSheet(
                 "Jak daleko od brzegu kadru waga rośnie do pełnej. Więcej = gładsze szwy.",
             ) { settings.feather = it }
             ToggleRow("Korekta obrazem", "Dopasowuje każdą klatkę do zszytej panoramy – usuwa dryf żyroskopu i drobne przesunięcia.", settings.imageAlign) { settings.imageAlign = it }
+            ToggleRow("Samokalibracja kąta widzenia", "Z dopasowania obrazem poprawia kąt widzenia aparatu, żeby brzegi klatek trafiały w siebie.", settings.autoFov) { settings.autoFov = it }
             ToggleRow("Wyrównanie ekspozycji", "Kompensuje różnice jasności między klatkami (jak gain compensation w OpenPano).", settings.autoGain) { settings.autoGain = it }
             SliderRow(
                 "Korekta winietowania", settings.vignette, 0f..0.8f, { "${(it * 100).roundToInt()}%" },

@@ -55,6 +55,7 @@ class Settings(context: Context) {
     var range by enumPref("range", CaptureRange.SPHERE)
     var maxSpeed by pref("maxSpeed", 45f)
     var imageAlign by pref("imageAlign", true)
+    var autoFov by pref("autoFov", true)
     var autoGain by pref("autoGain", true)
     var vignette by pref("vignette", 0.25f)
     var pointOverlap by pref("pointOverlap", 0.35f)

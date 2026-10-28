@@ -41,7 +41,7 @@ data class CameraInfo(
 )
 
 /**
- * CameraX: tylny aparat, klatki RGBA już obrócone do pionu, analiza na osobnym wątku.
+ * CameraX: tylny aparat, klatki RGBA obrócone do pionu (shader obsłuży też bufor nieobrócony), analiza na osobnym wątku.
  * Kąt widzenia liczony z ogniskowej i fizycznego rozmiaru matrycy (z uwzględnieniem kadrowania).
  */
 @OptIn(ExperimentalCamera2Interop::class)

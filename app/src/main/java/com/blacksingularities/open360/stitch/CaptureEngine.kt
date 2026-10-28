@@ -33,6 +33,8 @@ class StitchFrame {
     var tanX = 0.5f
     var tanY = 0.7f
     var gain = 1f
+    /** Obrót bufora (°, zgodnie ze wskazówkami), który stawia obraz pionowo. */
+    var rotation = 0
     var stitch = false
     var blend = BlendMode.BEST
     var feather = 0.35f
@@ -52,6 +54,7 @@ enum class Hint(val text: String) {
     NONE(""),
     WAIT_SENSOR("Czekam na czujnik orientacji…"),
     TOO_FAST("Wolniej – obraz się rozmywa"),
+    NO_MATCH("Nie pasuje – wróć do uchwyconego fragmentu"),
     AIM("Nakieruj środek na kropkę"),
     HOLD("Trzymaj nieruchomo…"),
     PAUSED("Wstrzymano – dotknij, aby malować"),
@@ -64,6 +67,8 @@ enum class Hint(val text: String) {
  * dopasowaniem do panoramy, wyrównuje ekspozycję, decyduje, czy klatkę zszyć, i przekazuje
  * ją do GPU. Stan dla interfejsu publikuje na wątek główny.
  */
+private const val GRAY_W = 160
+
 class CaptureEngine(private val settings: Settings, val tracker: OrientationTracker) {
     private val main = Handler(Looper.getMainLooper())
 
@@ -86,7 +91,8 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     private var undoCorr = Mat3.I
     private var undoTargets = BooleanArray(0)
     private var undoCount = 0
-    private var gray = GrayFrame(96, 128)
+    private var gray = GrayFrame(GRAY_W, 213)
+    private var mismatch = 0
     private var gain = 1f
     private var dwell = 0
     private var lastUi = 0L
@@ -127,9 +133,18 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     var onAllPointsDone: (() -> Unit)? = null
     var onRecordingChanged: ((Boolean) -> Unit)? = null
 
+    // Kąt widzenia z danych aparatu i samoczynna poprawka z dopasowania obrazem.
+    private var baseTanX = 0.55f
+    private var baseTanY = 0.73f
+    @Volatile var fovAuto = 1f
+        private set
+    private var fovChecks = 0
+
     fun setCamera(tanX: Float, tanY: Float) {
-        this.tanX = tanX
-        this.tanY = tanY
+        baseTanX = tanX
+        baseTanY = tanY
+        this.tanX = tanX * fovAuto
+        this.tanY = tanY * fovAuto
         rebuildTargets()
     }
 
@@ -190,6 +205,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             low.clear()
             ref = null
             corr = Mat3.I
+            fovChecks = 0
             gain = 1f
             hasContentInternal = false
         }
@@ -246,12 +262,17 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         val r = q.toMat3()
         val w = image.width
         val h = image.height
+        // Bufor przychodzi w orientacji matrycy – obrót do pionu robimy sami (CPU i shader).
+        val rot = ((image.imageInfo.rotationDegrees % 360) + 360) % 360
+        val uw = if (rot % 180 == 0) w else h
+        val uh = if (rot % 180 == 0) h else w
         val plane = image.planes[0]
         val src = plane.buffer
         val rowStride = plane.rowStride
 
-        val g = if (gray.w == 96 && gray.h == (96 * h / w).coerceAtLeast(8)) gray else GrayFrame(96, (96 * h / w).coerceAtLeast(8)).also { gray = it }
-        makeGray(src, rowStride, w, h, g)
+        val gh = (GRAY_W * uh / uw).coerceAtLeast(8)
+        val g = if (gray.h == gh) gray else GrayFrame(GRAY_W, gh).also { gray = it }
+        makeGray(src, rowStride, w, h, rot, g)
 
         val blend = settings.blend
         val feather = settings.feather
@@ -267,13 +288,22 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
             // Korekta dryfu: dopasowanie klatki do zszytej już panoramy.
             var ok = false
-            if (settings.imageAlign && hasContentInternal && g.contrast > 0.03f && spd < 90f) {
-                val res = align(devToPano, g)
-                if (res != null) {
-                    corr = res.first
-                    devToPano = corr * reference * r
-                    if (settings.autoGain && res.second > 0f) gain += (res.second - gain) * 0.3f
-                    ok = true
+            var bad = false
+            if (settings.imageAlign && hasContentInternal && g.contrast > 0.02f && spd < 120f) {
+                when (val res = align(devToPano, g)) {
+                    is Align.Ok -> {
+                        corr = res.corr
+                        devToPano = corr * reference * r
+                        if (settings.autoGain && res.gain > 0f) gain += (res.gain - gain) * 0.3f
+                        ok = true
+                        mismatch = 0
+                        if (settings.autoFov && res.ncc > 0.75f && ++fovChecks % 6 == 0) calibrateFov(devToPano, g)
+                    }
+                    Align.Mismatch -> {
+                        bad = true
+                        mismatch++
+                    }
+                    Align.NoOverlap -> mismatch = 0
                 }
             } else if (settings.autoGain && hasContentInternal) {
                 val gEst = gainEstimate(devToPano, g)
@@ -288,8 +318,11 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             if (recording) {
                 when (settings.mode) {
                     CaptureMode.CONTINUOUS -> {
-                        doStitch = spd < settings.maxSpeed
-                        if (!doStitch) curHint = Hint.TOO_FAST
+                        // Klatka sprzeczna z tym, co już zszyte, nie jest malowana (chyba że
+                        // niezgodność trwa długo – wtedy scena się zmieniła i trzeba ją przyjąć).
+                        val reject = bad && mismatch < 45
+                        doStitch = spd < settings.maxSpeed && !reject
+                        if (spd >= settings.maxSpeed) curHint = Hint.TOO_FAST else if (reject) curHint = Hint.NO_MATCH
                     }
                     CaptureMode.POINTS -> {
                         val ts2 = targets
@@ -301,7 +334,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                             if (ang < 3.5f) {
                                 if (spd < 14f) dwell++ else dwell = 0
                                 curHint = if (spd < 14f) Hint.HOLD else Hint.TOO_FAST
-                                if (dwell >= 4) {
+                                if (dwell >= 4 && (!bad || dwell >= 20)) {
                                     doStitch = true
                                     near.done = true
                                     dwell = 0
@@ -335,6 +368,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             val deadline = SystemClock.uptimeMillis() + 80
             while (f.ready && SystemClock.uptimeMillis() < deadline) frameLock.wait(10)
             f.ensure(w, h)
+            f.rotation = rot
             copyRgba(src, rowStride, w, h, f.buf)
             devToPano.transposed().toGl(f.panoToCam)
             f.tanX = tanX
@@ -426,7 +460,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     // ── Dopasowanie obrazem ─────────────────────────────────────────────────
 
-    private class Samples(val dirs: Array<Vec3>, val vals: FloatArray)
+    private class Samples(val dirs: Array<Vec3>, val vals: FloatArray, val coarse: IntArray)
 
     private var samples: Samples? = null
     private var samplesKey = ""
@@ -436,18 +470,24 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         samples?.let { if (samplesKey == key) return it.also { s -> fillVals(s, g) } }
         val step = 3
         val list = ArrayList<Vec3>()
+        val coarse = ArrayList<Int>()
         var y = 2
+        var row = 0
         while (y < g.h - 2) {
             var x = 2
+            var col = 0
             while (x < g.w - 2) {
+                if (row % 2 == 0 && col % 2 == 0) coarse += list.size
+                col++
                 val u = (x + 0.5f) / g.w
                 val v = (y + 0.5f) / g.h
                 list += Vec3((2 * u - 1) * tanX, (1 - 2 * v) * tanY, -1f).normalized()
                 x += step
             }
             y += step
+            row++
         }
-        val s = Samples(list.toTypedArray(), FloatArray(list.size))
+        val s = Samples(list.toTypedArray(), FloatArray(list.size), coarse.toIntArray())
         samples = s
         samplesKey = key
         fillVals(s, g)
@@ -463,89 +503,155 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         }
     }
 
-    /** Wynik: (1 − NCC, liczba próbek w zakładce, wzmocnienie). */
-    private fun score(rot: Mat3, s: Samples): FloatArray {
+    /** Wynik: (1 − NCC, udział próbek w zakładce, wzmocnienie). [idx] – podzbiór próbek albo null. */
+    private fun score(rot: Mat3, s: Samples, idx: IntArray? = null): FloatArray {
         var n = 0
         var sf = 0.0; var sc = 0.0; var sff = 0.0; var scc = 0.0; var sfc = 0.0
-        for (i in s.dirs.indices) {
-            val c = low.sample(rot.transform(s.dirs[i]))
+        val m = rot.m
+        val total = idx?.size ?: s.dirs.size
+        for (k in 0 until total) {
+            val i = idx?.get(k) ?: k
+            val d = s.dirs[i]
+            val c = low.sample(
+                Vec3(
+                    m[0] * d.x + m[1] * d.y + m[2] * d.z,
+                    m[3] * d.x + m[4] * d.y + m[5] * d.z,
+                    m[6] * d.x + m[7] * d.y + m[8] * d.z,
+                ),
+            )
             if (c.isNaN()) continue
             val f = s.vals[i].toDouble()
             n++
             sf += f; sc += c; sff += f * f; scc += c * c; sfc += f * c
         }
-        if (n < 20) return floatArrayOf(2f, n.toFloat(), 0f)
+        if (n < 20) return floatArrayOf(2f, n.toFloat() / total, 0f)
         val mf = sf / n; val mc = sc / n
         val vf = sff / n - mf * mf
         val vc = scc / n - mc * mc
         val cov = sfc / n - mf * mc
         val ncc = if (vf > 1e-6 && vc > 1e-6) cov / sqrt(vf * vc) else 0.0
         val gEst = if (mf > 0.02) (mc / mf).toFloat() else 0f
-        return floatArrayOf((1 - ncc).toFloat(), n.toFloat(), gEst)
+        return floatArrayOf((1 - ncc).toFloat(), n.toFloat() / total, gEst)
     }
 
     private fun gainEstimate(devToPano: Mat3, g: GrayFrame): Float {
         val s = samplesFor(g)
         val r = score(devToPano, s)
-        return if (r[1] > s.dirs.size * 0.2f) r[2] else 0f
+        return if (r[1] > 0.2f) r[2] else 0f
     }
 
-    /** Szuka małego obrotu (yaw, pitch, roll ≤ 2°) poprawiającego zgodność z panoramą. */
-    private fun align(devToPano: Mat3, g: GrayFrame): Pair<Mat3, Float>? {
+    private sealed class Align {
+        class Ok(val corr: Mat3, val gain: Float, val ncc: Float) : Align()
+        data object Mismatch : Align()
+        data object NoOverlap : Align()
+    }
+
+    /**
+     * Szuka obrotu (yaw, pitch, roll do ±4°) najlepiej zgadzającego klatkę z panoramą.
+     * Zgrubnie na co czwartej próbce, potem coraz drobniej na wszystkich (piramida kroków
+     * 1° → 0,5° → 0,25°). Miarą jest znormalizowana korelacja (odporna na zmiany jasności).
+     */
+    private fun align(devToPano: Mat3, g: GrayFrame): Align {
         val s = samplesFor(g)
         val base = score(devToPano, s)
-        if (base[1] < s.dirs.size * 0.25f) return null
+        if (base[1] < 0.2f) return Align.NoOverlap
         val forward = devToPano.transform(Vec3(0f, 0f, -1f))
         val right = forward.cross(Vec3(0f, 0f, 1f)).let { if (it.length() < 1e-3f) Vec3(1f, 0f, 0f) else it.normalized() }
 
         fun delta(yaw: Float, pitch: Float, roll: Float): Mat3 =
             Mat3.axisAngle(forward, roll * DEG) * Mat3.rotZ(yaw * DEG) * Mat3.axisAngle(right, pitch * DEG)
 
-        var bestY = 0f; var bestP = 0f; var bestR = 0f
-        var best = base
-        val coarse = floatArrayOf(-1.5f, -1f, -0.5f, 0f, 0.5f, 1f, 1.5f)
-        for (dy in coarse) for (dp in coarse) {
-            if (dy == 0f && dp == 0f) continue
-            val sc = score(delta(dy, dp, 0f) * devToPano, s)
-            if (sc[1] >= s.dirs.size * 0.25f && sc[0] < best[0]) {
-                best = sc; bestY = dy; bestP = dp
+        var bY = 0f; var bP = 0f; var bR = 0f
+        var best = score(devToPano, s, s.coarse)
+        fun tryAt(y: Float, p: Float, r: Float, idx: IntArray?): Boolean {
+            val sc = score(delta(y, p, r) * devToPano, s, idx)
+            if (sc[1] >= 0.2f && sc[0] < best[0]) {
+                best = sc; bY = y; bP = p; bR = r
+                return true
+            }
+            return false
+        }
+        // 1) Zgrubnie: yaw × pitch co 1°.
+        for (y in -4..4) for (p in -4..4) if (y != 0 || p != 0) tryAt(y.toFloat(), p.toFloat(), 0f, s.coarse)
+        // 2) Przechył co 1° w najlepszym miejscu.
+        run {
+            val y0 = bY; val p0 = bP
+            for (r in -3..3) if (r != 0) tryAt(y0, p0, r.toFloat(), s.coarse)
+        }
+        // 3) Wszystkie próbki: ±0,5° we wszystkich osiach.
+        best = score(delta(bY, bP, bR) * devToPano, s)
+        run {
+            val y0 = bY; val p0 = bP; val r0 = bR
+            for (dy in -1..1) for (dp in -1..1) for (dr in -1..1) {
+                if (dy == 0 && dp == 0 && dr == 0) continue
+                tryAt(y0 + dy * 0.5f, p0 + dp * 0.5f, r0 + dr * 0.5f, null)
             }
         }
-        val fine = floatArrayOf(-0.25f, -0.125f, 0f, 0.125f, 0.25f)
-        val cy = bestY; val cp = bestP
-        for (dy in fine) for (dp in fine) {
-            if (dy == 0f && dp == 0f) continue
-            val sc = score(delta(cy + dy, cp + dp, 0f) * devToPano, s)
-            if (sc[1] >= s.dirs.size * 0.25f && sc[0] < best[0]) {
-                best = sc; bestY = cy + dy; bestP = cp + dp
-            }
+        // 4) Doszlifowanie co 0,25°.
+        run {
+            val y0 = bY; val p0 = bP
+            for (dy in -1..1) for (dp in -1..1) if (dy != 0 || dp != 0) tryAt(y0 + dy * 0.25f, p0 + dp * 0.25f, bR, null)
         }
-        for (dr in floatArrayOf(-1f, -0.5f, 0.5f, 1f)) {
-            val sc = score(delta(bestY, bestP, dr) * devToPano, s)
-            if (sc[1] >= s.dirs.size * 0.25f && sc[0] < best[0]) {
-                best = sc; bestR = dr
+        val ncc = 1f - best[0]
+        // Wyraźna sprzeczność w dużej zakładce – klatka nie pasuje (ruch, paralaksa, błąd czujnika).
+        if (ncc < 0.35f && best[1] > 0.4f) return Align.Mismatch
+        // Słaba zgodność (gładka ściana) – nie ruszamy pozy, ale klatkę można przyjąć.
+        if (ncc < 0.6f) return Align.NoOverlap
+        if (bY == 0f && bP == 0f && bR == 0f) return Align.Ok(corr, best[2], ncc)
+        // Lekkie tłumienie – stabilnie, bez drgań.
+        return Align.Ok(delta(bY * 0.8f, bP * 0.8f, bR * 0.8f) * corr, best[2], ncc)
+    }
+
+    /**
+     * Samokalibracja kąta widzenia: błędny kąt rozjeżdża szwy coraz bardziej ku brzegom kadru.
+     * Porównujemy zgodność dla kadru o 2% węższego i szerszego i powoli przesuwamy poprawkę
+     * w lepszą stronę (w granicach ±12% danych producenta).
+     */
+    private fun calibrateFov(devToPano: Mat3, g: GrayFrame) {
+        val s = samplesFor(g)
+        fun scoreAt(k: Float): Float {
+            val dirs = Array(s.dirs.size) { i ->
+                val d = s.dirs[i]
+                Vec3(d.x / -d.z * k, d.y / -d.z * k, -1f).normalized()
             }
+            return score(devToPano, Samples(dirs, s.vals, s.coarse))[0]
         }
-        // Zbyt słaba zgodność (np. pusta ściana, ruchome obiekty) – nie ruszamy pozy.
-        if (1f - best[0] < 0.55f) return null
-        if (base[0] - best[0] < 0.004f) return Pair(corr, best[2])
-        // Tłumienie: połowa poprawki na klatkę – stabilnie i bez skoków.
-        val d = delta(bestY * 0.6f, bestP * 0.6f, bestR * 0.6f)
-        return Pair(d * corr, best[2])
+        val mid = scoreAt(1f)
+        val narrow = scoreAt(0.98f)
+        val wide = scoreAt(1.02f)
+        val step = when {
+            wide < mid - 0.002f && wide <= narrow -> 0.004f
+            narrow < mid - 0.002f && narrow < wide -> -0.004f
+            else -> 0f
+        }
+        if (step == 0f) return
+        fovAuto = (fovAuto + step).coerceIn(0.88f, 1.12f)
+        tanX = baseTanX * fovAuto
+        tanY = baseTanY * fovAuto
     }
 
     // ── Konwersje pikseli ───────────────────────────────────────────────────
 
-    private fun makeGray(src: ByteBuffer, rowStride: Int, w: Int, h: Int, g: GrayFrame) {
-        val sx = w.toFloat() / g.w
-        val sy = h.toFloat() / g.h
+    /** Szary obraz w orientacji pionowej; [rot] – obrót bufora zgodnie ze wskazówkami zegara. */
+    private fun makeGray(src: ByteBuffer, rowStride: Int, w: Int, h: Int, rot: Int, g: GrayFrame) {
         for (y in 0 until g.h) {
-            val py = ((y + 0.5f) * sy).toInt().coerceIn(0, h - 2)
+            val v = (y + 0.5f) / g.h
             for (x in 0 until g.w) {
-                val pxl = ((x + 0.5f) * sx).toInt().coerceIn(0, w - 2)
+                val u = (x + 0.5f) / g.w
+                // (u, v) w obrazie pionowym → (s, t) w buforze (oba z osią y w dół).
+                val bs: Float
+                val bt: Float
+                when (rot) {
+                    90 -> { bs = v; bt = 1f - u }
+                    180 -> { bs = 1f - u; bt = 1f - v }
+                    270 -> { bs = 1f - v; bt = u }
+                    else -> { bs = u; bt = v }
+                }
+                val px = (bs * w).toInt().coerceIn(0, w - 2)
+                val py = (bt * h).toInt().coerceIn(0, h - 2)
                 var acc = 0f
                 for (oy in 0..1) for (ox in 0..1) {
-                    val i = (py + oy) * rowStride + (pxl + ox) * 4
+                    val i = (py + oy) * rowStride + (px + ox) * 4
                     val rr = src.get(i).toInt() and 0xFF
                     val gg = src.get(i + 1).toInt() and 0xFF
                     val bb = src.get(i + 2).toInt() and 0xFF

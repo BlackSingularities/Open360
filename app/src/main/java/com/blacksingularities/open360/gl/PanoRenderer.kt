@@ -113,6 +113,7 @@ class PanoRenderer(
     private val camPanoToCam = FloatArray(9)
     private var camTanX = 0.5f
     private var camTanY = 0.7f
+    private var camRot = 0
     private val tmp9 = FloatArray(9)
     private val viewerQueue = ConcurrentLinkedQueue<ExportRequest>()
 
@@ -259,6 +260,7 @@ class PanoRenderer(
             f.panoToCam.copyInto(camPanoToCam)
             camTanX = f.tanX
             camTanY = f.tanY
+            camRot = f.rotation
             hasCam = true
             if (f.stitch && cw > 0) stitch(f.blend, f.feather, f.gain, f.vignette, f.box.x0, f.box.width, f.box.y0, f.box.y1)
         } finally {
@@ -284,6 +286,7 @@ class PanoRenderer(
         GlUtil.bindTex(stitchProg, "uCam", 1, camTex)
         glUniformMatrix3fv(glGetUniformLocation(stitchProg, "uPanoToCam"), 1, false, camPanoToCam, 0)
         glUniform2f(glGetUniformLocation(stitchProg, "uCamTan"), camTanX, camTanY)
+        glUniform1i(glGetUniformLocation(stitchProg, "uCamRot"), camRot)
         glUniform2f(glGetUniformLocation(stitchProg, "uCanvasSize"), cw.toFloat(), ch.toFloat())
         glUniform1i(glGetUniformLocation(stitchProg, "uBlend"), blendIndex(blend))
         glUniform1f(glGetUniformLocation(stitchProg, "uFeather"), feather)
@@ -339,6 +342,7 @@ class PanoRenderer(
         glUniform1i(glGetUniformLocation(p, "uHasCam"), if (live) 1 else 0)
         glUniformMatrix3fv(glGetUniformLocation(p, "uPanoToCam"), 1, false, camPanoToCam, 0)
         glUniform2f(glGetUniformLocation(p, "uCamTan"), camTanX, camTanY)
+        glUniform1i(glGetUniformLocation(p, "uCamRot"), camRot)
         glUniform1f(glGetUniformLocation(p, "uLiveAlpha"), view.liveAlpha)
         if (view.recording) {
             glUniform4f(glGetUniformLocation(p, "uFrameColor"), 1f, 1f, 1f, 1f)

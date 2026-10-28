@@ -15,14 +15,14 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Szara, niska rozdzielczość panoramy (0,5°/px) prowadzona równolegle z płótnem na GPU.
+ * Szara, niska rozdzielczość panoramy (0,25°/px) prowadzona równolegle z płótnem na GPU.
  * Służy do korekty pozy obrazem (dopasowanie klatki do tego, co już zszyte – idea z OpenPano,
  * ale zamiast cech SIFT szukamy obrotu minimalizującego różnicę jasności), do kompensacji
  * ekspozycji i do liczenia pokrycia.
  */
 class LowResCanvas {
-    val w = 720
-    val h = 360
+    val w = 1440
+    val h = 720
     val gray = FloatArray(w * h)
     val weight = FloatArray(w * h)
 
