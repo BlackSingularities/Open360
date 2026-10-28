@@ -56,13 +56,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NAME: ${{ steps.ver.outputs.name }}
         run: |
-          cp app/build/outputs/apk/release/app-release.apk "Open360-$NAME.apk"
-          # Stała nazwa – link „Pobierz” na stronie zawsze prowadzi do najnowszej wersji.
-          cp "Open360-$NAME.apk" Open360.apk
+          # Jeden plik o stałej nazwie – link „Pobierz” na stronie zawsze prowadzi do najnowszej wersji.
+          cp app/build/outputs/apk/release/app-release.apk Open360.apk
           NOTES=$(awk -v version="$NAME" '$0 == "## " version { found=1; next } found && /^## / { exit } found { print }' CHANGELOG.md)
           [ -z "$NOTES" ] && NOTES=$(git log -5 --pretty='- %s')
-          FOOTER=$(printf -- '---\n**Android:** pobierz **Open360-%s.apk** i zainstaluj go na telefonie (Android 10+).' "$NAME")
-          gh release create "$GITHUB_REF_NAME" "Open360-$NAME.apk" Open360.apk \
+          FOOTER=$(printf -- '---\n**Android:** pobierz **Open360.apk** i zainstaluj go na telefonie (Android 10+).')
+          gh release create "$GITHUB_REF_NAME" Open360.apk \
             --target "$GITHUB_SHA" \
             --title "Open360 $NAME" \
             --notes "$(printf '%s\n\n%s' "$NOTES" "$FOOTER")" \
