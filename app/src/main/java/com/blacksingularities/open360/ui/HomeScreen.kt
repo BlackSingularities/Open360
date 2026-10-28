@@ -3,6 +3,7 @@ package com.blacksingularities.open360.ui
 import android.graphics.Bitmap
 import android.net.Uri
 import android.text.format.DateFormat
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,9 +31,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.InstallMobile
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -40,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,7 +52,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -60,7 +63,9 @@ import com.blacksingularities.open360.export.PanoStore
 import com.blacksingularities.open360.update.Update
 import com.blacksingularities.open360.update.Updates
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Date
 import java.util.Locale
 
@@ -74,10 +79,23 @@ fun HomeScreen(
     onCancel: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val uriHandler = LocalUriHandler.current
     var items by remember { mutableStateOf<List<PanoItem>?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var update by remember { mutableStateOf<Update?>(null) }
+    val scope = rememberCoroutineScope()
+    // Postęp pobierania aktualizacji: null – nie trwa, -1 – rozmiar nieznany, 0–1 – ułamek.
+    var progress by remember { mutableStateOf<Float?>(null) }
+    var apk by remember { mutableStateOf<File?>(null) }
+
+    fun install(file: File) {
+        if (Updates.canInstall(context)) {
+            runCatching { Updates.install(context, file) }
+                .onFailure { Toast.makeText(context, "Nie udało się uruchomić instalatora", Toast.LENGTH_LONG).show() }
+        } else {
+            Toast.makeText(context, "Zezwól Open360 na instalowanie aplikacji, a potem dotknij „Zainstaluj”.", Toast.LENGTH_LONG).show()
+            runCatching { context.startActivity(Updates.permissionIntent(context)) }
+        }
+    }
 
     LaunchedEffect(refreshKey) {
         items = withContext(Dispatchers.IO) { PanoStore.list(context) }
@@ -145,11 +163,45 @@ fun HomeScreen(
                         .padding(14.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    val p = progress
+                    val file = apk
                     Column(Modifier.weight(1f)) {
                         Text("Dostępna wersja ${u.version}", fontWeight = FontWeight.Bold)
-                        Text("Pobierz i zainstaluj nowy plik APK.", color = Palette.TextDim, fontSize = 13.sp)
+                        Text(
+                            when {
+                                file != null -> "Pobrano – dotknij, aby zainstalować."
+                                p == null -> "Pobierz i zainstaluj aktualizację w aplikacji."
+                                p < 0f -> "Pobieranie…"
+                                else -> "Pobieranie… ${(p * 100).toInt()}%"
+                            },
+                            color = Palette.TextDim, fontSize = 13.sp,
+                        )
+                        if (p != null && file == null) {
+                            Spacer(Modifier.height(8.dp))
+                            if (p < 0f) {
+                                LinearProgressIndicator(Modifier.fillMaxWidth(), color = Color.White, trackColor = Palette.Line)
+                            } else {
+                                LinearProgressIndicator({ p }, Modifier.fillMaxWidth(), color = Color.White, trackColor = Palette.Line)
+                            }
+                        }
                     }
-                    Pill("Pobierz", icon = Icons.Outlined.Download, active = true) { runCatching { uriHandler.openUri(u.apkUrl) } }
+                    Spacer(Modifier.width(12.dp))
+                    when {
+                        file != null -> Pill("Zainstaluj", icon = Icons.Outlined.InstallMobile, active = true) { install(file) }
+                        p == null -> Pill("Pobierz", icon = Icons.Outlined.Download, active = true) {
+                            progress = 0f
+                            scope.launch {
+                                val f = Updates.download(context, u) { progress = it }
+                                progress = null
+                                if (f != null) {
+                                    apk = f
+                                    install(f)
+                                } else {
+                                    Toast.makeText(context, "Nie udało się pobrać aktualizacji", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

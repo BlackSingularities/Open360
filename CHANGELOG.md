@@ -3,6 +3,7 @@
 ## 1.2.0
 
 - Open360 jako źródło plików: gdy przeglądarka lub inna aplikacja prosi o wybranie zdjęcia (np. przy przesyłaniu na stronę), można wskazać zapisaną panoramę albo od razu zrobić nową – trafi prosto do tej aplikacji.
+- Aktualizacje pobierają się w aplikacji (z paskiem postępu) i od razu otwierają instalator – bez przechodzenia do GitHuba w przeglądarce.
 
 ## 1.1.0
 

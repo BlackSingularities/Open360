@@ -1,9 +1,16 @@
 package com.blacksingularities.open360.update
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import com.blacksingularities.open360.BuildConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -30,6 +37,68 @@ object Updates {
             }
             apk?.let { Update(tag, it, j.optString("body")) }
         }.getOrNull()
+    }
+
+    /**
+     * Pobiera APK do pamięci podręcznej aplikacji; [onProgress] dostaje ułamek 0–1
+     * (albo -1, gdy serwer nie podał rozmiaru). Zwraca plik albo null przy błędzie.
+     */
+    suspend fun download(context: Context, update: Update, onProgress: (Float) -> Unit): File? = withContext(Dispatchers.IO) {
+        val dir = File(context.cacheDir, "updates").apply { deleteRecursively(); mkdirs() }
+        val part = File(dir, "Open360-${update.version}.apk.part")
+        runCatching {
+            val c = URL(update.apkUrl).openConnection() as HttpURLConnection
+            c.connectTimeout = 10000
+            c.readTimeout = 20000
+            c.instanceFollowRedirects = true
+            if (c.responseCode !in 200..299) error("HTTP ${c.responseCode}")
+            val total = c.contentLengthLong
+            c.inputStream.use { input ->
+                part.outputStream().use { out ->
+                    val buf = ByteArray(64 * 1024)
+                    var done = 0L
+                    var last = -1
+                    while (true) {
+                        ensureActive()
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        done += n
+                        if (total > 0) {
+                            val pct = (done * 100 / total).toInt()
+                            if (pct != last) {
+                                last = pct
+                                onProgress(done.toFloat() / total)
+                            }
+                        } else if (last != -2) {
+                            last = -2
+                            onProgress(-1f)
+                        }
+                    }
+                }
+            }
+            if (total > 0 && part.length() != total) error("niepełny plik")
+            File(dir, "Open360-${update.version}.apk").also { part.renameTo(it) }
+        }.getOrElse {
+            part.delete()
+            null
+        }
+    }
+
+    /** Czy system pozwala tej aplikacji instalować pobrane APK. */
+    fun canInstall(context: Context): Boolean = context.packageManager.canRequestPackageInstalls()
+
+    /** Ekran ustawień, w którym użytkownik zezwala na instalowanie aktualizacji z Open360. */
+    fun permissionIntent(context: Context): Intent =
+        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + context.packageName))
+
+    /** Otwiera systemowy instalator dla pobranego pliku. */
+    fun install(context: Context, apk: File) {
+        val uri = FileProvider.getUriForFile(context, BuildConfig.APPLICATION_ID + ".files", apk)
+        val i = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(i)
     }
 
     fun newer(remote: String, local: String): Boolean {
