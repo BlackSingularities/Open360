@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open360 — Panoramy 360° na żywo</title>
+<meta name="description" content="Twórz panoramy 360° aparatem telefonu i patrz, jak sfera wypełnia się na żywo. Zszywanie na GPU, tryb punktów, mała planeta, VR i metadane 360° dla Google Zdjęć.">
+<meta property="og:title" content="Open360">
+<meta property="og:description" content="Panoramy 360° na żywo z aparatu telefonu">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f6f6f4; --surface: #ffffff; --text: #141414; --muted: #5c5c58;
+    --line: #e2e1dc; --accent: #141414; --on-accent: #ffffff; --coffee: #f2c14e; --on-coffee: #241a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --surface: #111111; --text: #f2f2f0; --muted: #a2a29c;
+      --line: #262626; --accent: #f2f2f0; --on-accent: #000000;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: inherit; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+
+  header.hero { padding: 72px 0 40px; text-align: center; }
+  .icon { width: 96px; height: 96px; border-radius: 24px; display: block; margin: 0 auto 24px; }
+  h1 { font-size: clamp(36px, 7vw, 56px); line-height: 1.05; margin: 0 0 12px; letter-spacing: -0.02em; }
+  .tagline { font-size: clamp(18px, 3vw, 22px); color: var(--muted); margin: 0 auto 20px; max-width: 34ch; }
+  .lead { max-width: 62ch; margin: 0 auto 32px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 24px; border-radius: 999px;
+         font-weight: 600; text-decoration: none; border: 1px solid transparent; }
+  .btn.primary { background: var(--accent); color: var(--on-accent); }
+  .btn:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  .meta { margin-top: 16px; font-size: 14px; color: var(--muted); }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 20px 0 0; padding: 0; list-style: none; }
+  .pills li { font-size: 13px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); }
+
+  .demo { margin: 8px auto 0; max-width: 640px; aspect-ratio: 2 / 1; border-radius: 24px; overflow: hidden;
+          background: #000; border: 1px solid var(--line); }
+  .demo canvas { width: 100%; height: 100%; display: block; }
+
+  section { padding: 40px 0; }
+  h2 { font-size: 26px; margin: 0 0 20px; letter-spacing: -0.01em; }
+  .features { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px;
+              grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .feat { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
+  .feat h3 { font-size: 17px; margin: 0 0 6px; }
+  .feat p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+  .steps li { display: flex; gap: 14px; align-items: flex-start; background: var(--surface);
+              border: 1px solid var(--line); border-radius: 18px; padding: 16px 20px; }
+  .steps b { flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--on-accent);
+             display: grid; place-items: center; font-size: 14px; }
+
+  .support { background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+             padding: 32px; text-align: center; }
+  .support p { max-width: 56ch; margin: 0 auto 20px; color: var(--muted); }
+  .btn.coffee { background: var(--coffee); color: var(--on-coffee); }
+
+  footer { padding: 32px 0 48px; text-align: center; font-size: 14px; color: var(--muted); }
+  footer a { font-weight: 600; color: var(--text); }
+</style>
+</head>
+<body>
+<header class="hero wrap">
+  <img class="icon" src="icon.svg" alt="" width="96" height="96">
+  <h1>Open360</h1>
+  <p class="tagline">Panoramy 360° na żywo z aparatu telefonu</p>
+  <p class="lead">Wodzisz telefonem – a sfera wypełnia się na ekranie w czasie rzeczywistym. Pełna sfera, pas horyzontu albo dowolny fragment. Zapis jako zdjęcie 360°, które Google Zdjęcia i Facebook pokażą jako panoramę.</p>
+  <div class="actions">
+    <a class="btn primary" id="download" href="https://github.com/BlackSingularities/Open360/releases/latest/download/Open360.apk">Pobierz na Androida</a>
+  </div>
+  <p class="meta" id="version">Plik APK · Android 10 lub nowszy</p>
+  <ul class="pills">
+    <li>Darmowa</li><li>Bez reklam</li><li>Bez śledzenia</li><li>Działa offline</li>
+  </ul>
+</header>
+
+<main class="wrap">
+  <div class="demo" aria-hidden="true"><canvas id="demo" width="1280" height="640"></canvas></div>
+
+  <section aria-labelledby="f">
+    <h2 id="f">Co potrafi</h2>
+    <ul class="features">
+      <li class="feat"><h3>Podgląd na żywo</h3><p>Kadr kamery wtapia się w sferę dokładnie tam, gdzie celujesz. Widać, co już jest, a czego brakuje.</p></li>
+      <li class="feat"><h3>Zszywanie na GPU</h3><p>Każda klatka trafia na płótno równoprostokątne do 8K w ułamku sekundy.</p></li>
+      <li class="feat"><h3>Korekta obrazem</h3><p>Klatki są dopasowywane do już zszytej panoramy – bez dryfu żyroskopu i schodków na krawędziach.</p></li>
+      <li class="feat"><h3>Cztery sposoby łączenia</h3><p>Najostrzejsza, miękkie przenikanie, tylko puste miejsca albo nadpisywanie – na ludzi w ruchu i trudne światło.</p></li>
+      <li class="feat"><h3>Tryb punktów</h3><p>Siatka celów prowadzi po sferze, a zdjęcie robi się samo, gdy kadr jest nieruchomy.</p></li>
+      <li class="feat"><h3>Dowolny zakres</h3><p>Pełna sfera, bez nadiru, pas horyzontu albo pół panoramy. Zapisujesz, kiedy chcesz.</p></li>
+      <li class="feat"><h3>Równe światło</h3><p>Blokada ekspozycji i bieli, wyrównanie jasności między klatkami i korekta winietowania.</p></li>
+      <li class="feat"><h3>Przeglądarka 360°</h3><p>Perspektywa, mała planeta, tunel i mapa. Rozglądanie telefonem, automatyczny obrót i tryb gogli VR.</p></li>
+      <li class="feat"><h3>Zdjęcia 360° wszędzie</h3><p>Metadane GPano, wypełnianie dziur, kadrowanie do treści i eksport małej planety jako zdjęcia.</p></li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="h">
+    <h2 id="h">Jak zrobić dobrą panoramę</h2>
+    <ol class="steps">
+      <li><b>1</b><span>Obracaj telefon wokół obiektywu, nie wokół siebie – trzymaj go blisko, łokcie przy ciele.</span></li>
+      <li><b>2</b><span>Zacznij od horyzontu, potem niebo i ziemia. Ruszaj się powoli – zbyt szybkie klatki są pomijane.</span></li>
+      <li><b>3</b><span>Dopełniaj puste miejsca widoczne na podglądzie i zapisz w dowolnej chwili.</span></li>
+    </ol>
+  </section>
+
+  <section aria-labelledby="s">
+    <div class="support">
+      <h2 id="s">Wesprzyj projekt</h2>
+      <p>Open360 jest darmowy i bez reklam. Jeśli Ci się przydaje, możesz postawić autorowi kawę.</p>
+      <a class="btn coffee" href="https://buycoffee.to/adamredzikowski">☕ Postaw kawę na buycoffee.to</a>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">
+  Pomysł i wykonanie: Adam Rędzikowski · <a href="https://redzikowski.com">redzikowski.com</a>
+</footer>
+
+<script>
+  // Przycisk prowadzi prosto do pliku APK z najnowszego wydania.
+  fetch("https://api.github.com/repos/BlackSingularities/Open360/releases/latest")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (rel) {
+      if (!rel) return;
+      var v = (rel.tag_name || "").replace(/^v/, "");
+      if (v) document.getElementById("version").textContent = "Wersja " + v + " · Android 10 lub nowszy";
+    })
+    .catch(function () {});
+
+  // Demonstracja: sfera „maluje się” w projekcji równoprostokątnej jak w aplikacji.
+  (function () {
+    var c = document.getElementById("demo"), g = c.getContext("2d"), W = c.width, H = c.height;
+    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var painted = [];
+    function tone(y) {
+      var t = y / H;
+      if (t > 0.5) return "rgb(" + Math.round(40 + 50 * t) + "," + Math.round(48 + 40 * t) + "," + Math.round(36 + 20 * t) + ")";
+      return "rgb(" + Math.round(30 + 140 * (1 - t)) + "," + Math.round(60 + 120 * (1 - t)) + "," + Math.round(110 + 120 * (1 - t)) + ")";
+    }
+    function frame(time) {
+      g.fillStyle = "#0e0e0e"; g.fillRect(0, 0, W, H);
+      g.strokeStyle = "rgba(255,255,255,.12)"; g.lineWidth = 1;
+      for (var i = 0; i <= 24; i++) { g.beginPath(); g.moveTo(i * W / 24, 0); g.lineTo(i * W / 24, H); g.stroke(); }
+      for (var j = 0; j <= 12; j++) { g.beginPath(); g.moveTo(0, j * H / 12); g.lineTo(W, j * H / 12); g.stroke(); }
+      var s = reduce ? 0.6 : time / 6000;
+      var cx = (s % 1) * W, cy = H / 2 + Math.sin(s * 5) * H * 0.28;
+      if (!reduce) painted.push([cx, cy]);
+      if (painted.length > 420) painted.shift();
+      painted.forEach(function (p) { g.fillStyle = tone(p[1]); g.fillRect(p[0] - 90, p[1] - 70, 180, 140); });
+      g.strokeStyle = "rgba(255,255,255,.55)"; g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+      g.strokeStyle = "#fff"; g.lineWidth = 4; g.strokeRect(cx - 90, cy - 70, 180, 140);
+      if (!reduce) requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  })();
+</script>
+</body>
+</html>

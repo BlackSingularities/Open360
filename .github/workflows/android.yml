@@ -1,0 +1,69 @@
+name: Build & Release (Android)
+
+# Budowanie i wydanie wyłącznie po wypchnięciu tagu wersji (np. v1.2.3).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wersja
+        id: ver
+        run: |
+          echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "code=$(( ${{ github.run_number }} + 100 ))" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Klucz podpisu
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+          echo "SIGNING_KEYSTORE_PATH=$RUNNER_TEMP/release.p12" >> "$GITHUB_ENV"
+
+      - name: Testy jednostkowe
+        run: gradle testDebugUnitTest --stacktrace
+
+      - name: Budowanie APK
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: gradle :app:assembleRelease -PversionCode=${{ steps.ver.outputs.code }} -PversionName=${{ steps.ver.outputs.name }} --stacktrace
+
+      - name: Publikacja wydania
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk "Open360-$NAME.apk"
+          # Stała nazwa – link „Pobierz” na stronie zawsze prowadzi do najnowszej wersji.
+          cp "Open360-$NAME.apk" Open360.apk
+          NOTES=$(awk -v version="$NAME" '$0 == "## " version { found=1; next } found && /^## / { exit } found { print }' CHANGELOG.md)
+          [ -z "$NOTES" ] && NOTES=$(git log -5 --pretty='- %s')
+          FOOTER=$(printf -- '---\n**Android:** pobierz **Open360-%s.apk** i zainstaluj go na telefonie (Android 10+).' "$NAME")
+          gh release create "$GITHUB_REF_NAME" "Open360-$NAME.apk" Open360.apk \
+            --target "$GITHUB_SHA" \
+            --title "Open360 $NAME" \
+            --notes "$(printf '%s\n\n%s' "$NOTES" "$FOOTER")" \
+            --latest
