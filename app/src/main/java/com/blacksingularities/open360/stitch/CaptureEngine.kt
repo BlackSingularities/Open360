@@ -9,52 +9,29 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.blacksingularities.open360.camera.FrameMeta
 import com.blacksingularities.open360.camera.OrientationTracker
-import com.blacksingularities.open360.data.BlendMode
 import com.blacksingularities.open360.data.CaptureMode
 import com.blacksingularities.open360.data.Settings
-import com.blacksingularities.open360.gl.ExportRequest
 import com.blacksingularities.open360.math.DEG
 import com.blacksingularities.open360.math.Mat3
+import com.blacksingularities.open360.math.PI_F
 import com.blacksingularities.open360.math.Vec3
 import com.blacksingularities.open360.math.angleBetween
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.abs
-import kotlin.math.sqrt
-
-/** Klatka przekazywana do wątku GL: piksele RGBA, poza i polecenie zszycia. */
-class StitchFrame {
-    var w = 0
-    var h = 0
-    var buf: ByteBuffer = ByteBuffer.allocateDirect(4)
-    val panoToCam = FloatArray(9)
-    var tanX = 0.5f
-    var tanY = 0.7f
-    var gain = 1f
-    /** Obrót bufora (°, zgodnie ze wskazówkami), który stawia obraz pionowo. */
-    var rotation = 0
-    var stitch = false
-    var blend = BlendMode.BEST
-    var feather = 0.35f
-    var vignette = 0f
-    var box = LonLatBox(0, 1, 0, 1)
-    @Volatile var ready = false
-
-    fun ensure(w: Int, h: Int) {
-        if (buf.capacity() < w * h * 4) buf = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
-        this.w = w
-        this.h = h
-    }
-}
+import kotlin.math.atan
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 /** Komunikat dla użytkownika w trakcie robienia panoramy. */
-enum class Hint(val text: String) {
+enum class Hint(val text: String, val warning: Boolean = false) {
     NONE(""),
     WAIT_SENSOR("Czekam na czujnik orientacji…"),
-    TOO_FAST("Wolniej – obraz się rozmywa"),
-    NO_MATCH("Nie pasuje – wróć do uchwyconego fragmentu"),
+    TOO_FAST("Za szybko! Zwolnij – klatki się rozmazują", warning = true),
+    BLURRY("Rozmazane – kadr odrzucony. Prowadź wolniej", warning = true),
+    NO_MATCH("Nie pasuje – wróć do uchwyconego fragmentu", warning = true),
     AIM("Nakieruj środek na kropkę"),
     HOLD("Trzymaj nieruchomo…"),
     PAUSED("Wstrzymano – dotknij, aby malować"),
@@ -63,40 +40,70 @@ enum class Hint(val text: String) {
 }
 
 /**
- * Mózg zszywania (wątek analizy kamery): przypisuje klatce pozę z czujników, poprawia ją
- * dopasowaniem do panoramy, wyrównuje ekspozycję, decyduje, czy klatkę zszyć, i przekazuje
- * ją do GPU. Stan dla interfejsu publikuje na wątek główny.
+ * Mózg zszywania (wątek analizy kamery). Dla każdej klatki:
+ *  1. poza z czujnika w chwili środka naświetlania (z czasem odczytu matrycy i samoczynnie
+ *     wyznaczanym przesunięciem zegarów), prędkość kątowa → model migawki szczelinowej,
+ *  2. rozmycie ruchu = prędkość × czas naświetlania w pikselach panoramy – klatki rozmazane
+ *     nie są zszywane (i użytkownik dostaje ostrzeżenie),
+ *  3. zgrubne dopasowanie obrazem (każda klatka – śledzi dryf żyroskopu),
+ *  4. dla klatek kluczowych: dokładne dopasowanie (Gauss-Newton, ułamek piksela), test
+ *     ostrości względem już zszytej treści, wyrównanie ekspozycji i winietowania,
+ *     samokalibracja kąta widzenia – i zszycie na CPU (odniesienie) oraz GPU (obraz).
  */
-private const val GRAY_W = 160
-
 class CaptureEngine(private val settings: Settings, val tracker: OrientationTracker) {
     private val main = Handler(Looper.getMainLooper())
 
-    // Parametry kamery (pion telefonu): połówkowe tangensy kąta widzenia.
+    // Kąt widzenia (pion telefonu): połówkowe tangensy; bazowe z danych aparatu × kalibracja.
     @Volatile var tanX = 0.55f
         private set
     @Volatile var tanY = 0.73f
         private set
+    private var baseTanX = 0.55f
+    private var baseTanY = 0.73f
+    private var frameShort = 1080
     @Volatile var timestampsRealtime = true
 
-    /** Rozmiar płótna GPU – do wyznaczania zakresu zszywania. */
+    /** Rozmiar płótna GPU (ustawia renderer). */
     @Volatile var canvasW = 4096
+        set(v) {
+            field = v
+            updateTargets()
+        }
+    /** Czy renderer trzyma kopię do cofania (przy 16K – nie). */
+    @Volatile var undoSupported = true
+
+    /** Docelowy czas naświetlania (ns) na czas zbierania – czyta CameraController. */
+    @Volatile var targetExposureNs = 4_000_000L
+        private set
 
     // Referencja kierunku (yaw startowy) i korekta dryfu z dopasowania obrazem.
     @Volatile private var ref: Mat3? = null
     @Volatile private var corr = Mat3.I
 
-    private val low = LowResCanvas()
-    private val lowUndo = LowResCanvas()
+    private val lock = Any()
+    private val coarse = GrayCanvas(1440, 720)
+    private val fine = GrayCanvas(3600, 1800)
+    private val coarseUndo = GrayCanvas(1440, 720)
+    private val fineUndo = GrayCanvas(3600, 1800)
     private var undoCorr = Mat3.I
     private var undoTargets = BooleanArray(0)
     private var undoCount = 0
+
     private var gray = GrayFrame(GRAY_W, 213)
+    private var fineGray = GrayFrame(560, 742)
     private var mismatch = 0
     private var gain = 1f
     private var dwell = 0
     private var lastUi = 0L
     private var stitchedSinceCoverage = 0
+    private var keyframes = 0
+    private var blurryUntil = 0L
+    private var lastWarnMs = 0L
+
+    private val vignette = VignetteEstimator()
+    private val sync = SyncEstimator()
+    private val fov = FovEstimator()
+    private val policy = KeyframePolicy()
 
     val frame = StitchFrame()
     private val frameLock = Object()
@@ -109,15 +116,21 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         private set
     var coverage by mutableFloatStateOf(0f)
         private set
+    /** Prędkość obrotu (°/s) i dopuszczalna prędkość przy obecnym czasie naświetlania. */
     var speed by mutableFloatStateOf(0f)
+        private set
+    var speedLimit by mutableFloatStateOf(30f)
+        private set
+    /** Rozmycie w ułamku dopuszczalnego (≥ 1 – klatki odrzucane). */
+    var blurLevel by mutableFloatStateOf(0f)
         private set
     var hint by mutableStateOf(Hint.READY)
         private set
     var stitched by mutableIntStateOf(0)
         private set
-    var aligned by mutableStateOf(false)
+    var rejected by mutableIntStateOf(0)
         private set
-    var exposureGain by mutableFloatStateOf(1f)
+    var aligned by mutableStateOf(false)
         private set
     var canUndo by mutableStateOf(false)
         private set
@@ -128,28 +141,36 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     var hasContent by mutableStateOf(false)
         private set
 
-    /** Zdarzenia: zdjęcie w punkcie, ukończenie siatki, zmiana nagrywania (blokada ekspozycji). */
+    /** Zdarzenia: zdjęcie w punkcie, ukończenie siatki, zmiana nagrywania, ostrzeżenie o ruchu. */
     var onPointCaptured: (() -> Unit)? = null
     var onAllPointsDone: (() -> Unit)? = null
     var onRecordingChanged: ((Boolean) -> Unit)? = null
+    var onMotionWarning: (() -> Unit)? = null
 
-    // Kąt widzenia z danych aparatu i samoczynna poprawka z dopasowania obrazem.
-    private var baseTanX = 0.55f
-    private var baseTanY = 0.73f
     @Volatile var fovAuto = 1f
         private set
-    private var fovChecks = 0
 
-    fun setCamera(tanX: Float, tanY: Float) {
+    fun setCamera(tanX: Float, tanY: Float, frameShort: Int) {
         baseTanX = tanX
         baseTanY = tanY
+        this.frameShort = frameShort
         this.tanX = tanX * fovAuto
         this.tanY = tanY * fovAuto
+        updateTargets()
         rebuildTargets()
     }
 
+    /** Piksele na radian, którymi naprawdę dysponujemy (mniejsze z płótna i klatki). */
+    private fun pxPerRad(): Float = min(canvasW / (2f * PI_F), frameShort / (2f * tanX))
+
+    private fun updateTargets() {
+        // Czas naświetlania, przy którym obrót 20°/s rozmywa o ~80% dopuszczalnego.
+        val t = BLUR_MAX * 0.8f / (20f * DEG * pxPerRad())
+        targetExposureNs = (t * 1e9f).toLong().coerceIn(500_000L, 33_000_000L)
+    }
+
     fun rebuildTargets() {
-        val t = TargetGrid.build(settings.range, tanX, tanY, settings.pointOverlap)
+        val t = TargetGrid.build(settings.range, tanX, tanY, POINT_OVERLAP)
         main.post {
             targets = t
             targetsDone = 0
@@ -162,14 +183,16 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     fun start() {
         if (recording) return
-        synchronized(low) {
-            lowUndo.copyFrom(low)
+        synchronized(lock) {
+            coarseUndo.copyFrom(coarse)
+            fineUndo.copyFrom(fine)
             undoCorr = corr
             undoTargets = BooleanArray(targets.size) { targets[it].done }
             undoCount = stitched
+            policy.reset()
         }
         glCommands += GlCommand.Snapshot
-        canUndo = hasContent
+        canUndo = hasContent && undoSupported
         recording = true
         hint = if (settings.mode == CaptureMode.POINTS) Hint.AIM else Hint.NONE
         onRecordingChanged?.invoke(true)
@@ -185,32 +208,40 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     fun undo() {
         if (!canUndo) return
         pause()
-        synchronized(low) {
-            low.copyFrom(lowUndo)
+        synchronized(lock) {
+            coarse.copyFrom(coarseUndo)
+            fine.copyFrom(fineUndo)
             corr = undoCorr
             targets.forEachIndexed { i, t -> t.done = undoTargets.getOrElse(i) { false } }
             hasContentInternal = undoCount > 0
+            policy.reset()
         }
         glCommands += GlCommand.Restore
         stitched = undoCount
         targetsDone = targets.count { it.done }
-        coverage = low.coverage(settings.range)
+        coverage = synchronized(lock) { coarse.coverage(settings.range) }
         hasContent = stitched > 0
         canUndo = false
     }
 
     fun reset() {
         pause()
-        synchronized(low) {
-            low.clear()
+        synchronized(lock) {
+            coarse.clear()
+            fine.clear()
             ref = null
             corr = Mat3.I
-            fovChecks = 0
             gain = 1f
+            keyframes = 0
+            mismatch = 0
+            vignette.reset()
+            sync.reset()
+            policy.reset()
             hasContentInternal = false
         }
         glCommands += GlCommand.Clear
         stitched = 0
+        rejected = 0
         coverage = 0f
         hasContent = false
         canUndo = false
@@ -220,12 +251,13 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         rebuildTargets()
     }
 
-    /** Ustawia bieżący kierunek jako środek panoramy (tylko przed pierwszą klatką). */
-    fun recenter() {
-        if (!hasContent) ref = null
-    }
+    fun contentBounds(fullW: Int, fullH: Int): IntArray? = synchronized(lock) { coarse.contentBounds(fullW, fullH) }
 
-    fun contentBounds(fullW: Int, fullH: Int): IntArray? = synchronized(low) { low.contentBounds(fullW, fullH) }
+    /** Wyostrzanie przy eksporcie: mocniej, gdy płótno ma więcej pikseli niż klatki. */
+    fun exportSharpen(): Float {
+        val ratio = (canvasW / (2f * PI_F)) / (frameShort / (2f * tanX))
+        return (0.25f + 0.35f * (ratio - 0.7f)).coerceIn(0.2f, 0.6f)
+    }
 
     /** Obrót: układ urządzenia teraz → panorama (dla podglądu, z najświeższej próbki czujnika). */
     fun viewDevToPano(): Mat3? {
@@ -242,109 +274,119 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     // ── Klatki (wątek analizy) ───────────────────────────────────────────────
 
-    fun onFrame(image: ImageProxy) {
+    fun onFrame(image: ImageProxy, meta: FrameMeta?) {
         try {
-            process(image)
+            process(image, meta)
         } finally {
             image.close()
         }
     }
 
-    private fun process(image: ImageProxy) {
-        val ts = image.imageInfo.timestamp - settings.syncDelayMs * 1_000_000L
+    @Volatile private var hasContentInternal = false
+    @Volatile private var alignedInternal = false
+
+    private fun process(image: ImageProxy, meta: FrameMeta?) {
+        val ts = image.imageInfo.timestamp
+        val expNs = meta?.exposureNs?.takeIf { it > 0 } ?: 20_000_000L
+        val skewNs = meta?.skewNs?.takeIf { it in 1..80_000_000 } ?: 0L
+        // Poza z chwili środka naświetlania środkowego wiersza.
+        val tc = ts + skewNs / 2 + expNs / 2 + (sync.offset * 1e9f).toLong()
         val now = SystemClock.elapsedRealtimeNanos()
-        val q = (if (timestampsRealtime && abs(now - ts) < 1_000_000_000L) tracker.poseAt(ts) else null)
-            ?: tracker.latest
+        val useTs = timestampsRealtime && abs(now - tc) < 1_000_000_000L
+        val q = (if (useTs) tracker.poseAt(tc) else null) ?: tracker.latest
         if (q == null) {
             postHint(Hint.WAIT_SENSOR)
             return
         }
         val r = q.toMat3()
+        val wWorld = (if (useTs) tracker.omegaAt(tc) else null) ?: tracker.omegaAt(now) ?: Vec3(0f, 0f, 0f)
+        val wDev = r.transformT(wWorld)
         val w = image.width
         val h = image.height
-        // Bufor przychodzi w orientacji matrycy – obrót do pionu robimy sami (CPU i shader).
         val rot = ((image.imageInfo.rotationDegrees % 360) + 360) % 360
         val uw = if (rot % 180 == 0) w else h
         val uh = if (rot % 180 == 0) h else w
-        val plane = image.planes[0]
-        val src = plane.buffer
-        val rowStride = plane.rowStride
+        val yPlane = image.planes[0]
 
         val gh = (GRAY_W * uh / uw).coerceAtLeast(8)
         val g = if (gray.h == gh) gray else GrayFrame(GRAY_W, gh).also { gray = it }
-        makeGray(src, rowStride, w, h, rot, g)
+        GrayFrame.fromLuma(yPlane.buffer, yPlane.rowStride, w, h, rot, g)
 
-        val blend = settings.blend
-        val feather = settings.feather
+        // Rozmycie ruchu w pikselach panoramy (lub klatki, jeśli ma mniej szczegółów).
+        val ppr = pxPerRad()
+        val blurPx = MotionBlur.pixels(wDev, expNs / 1e9f, tanY, ppr)
+        val quality = MotionBlur.quality(blurPx)
+        val tooFast = blurPx > BLUR_MAX
+        val limitDeg = BLUR_MAX / (expNs / 1e9f * ppr) / DEG
         val spd = tracker.angularSpeed
+
+        val nowMs = SystemClock.uptimeMillis()
         var doStitch = false
         var devToPano: Mat3
+        var geom: FrameGeom
         var pointHit = false
         var allDone = false
+        var blurryReject = false
         var curHint: Hint
-        synchronized(low) {
+        synchronized(lock) {
             val reference = ref ?: referenceFor(r).also { ref = it }
+            geom = FrameGeom(tanX, tanY, rot, skewNs / 1e9f, wDev)
             devToPano = corr * reference * r
 
-            // Korekta dryfu: dopasowanie klatki do zszytej już panoramy.
-            var ok = false
+            // 1) Zgrubna korekta dryfu – na każdej (nierozmazanej) klatce.
             var bad = false
-            if (settings.imageAlign && hasContentInternal && g.contrast > 0.02f && spd < 120f) {
-                when (val res = align(devToPano, g)) {
-                    is Align.Ok -> {
-                        corr = res.corr
+            alignedInternal = false
+            if (hasContentInternal && g.contrast > 0.02f && blurPx < BLUR_MAX * 2.5f) {
+                val res = Aligner.coarse(coarse, SampleSet.dense(g, 3), geom, devToPano)
+                when (res.status) {
+                    AlignResult.Status.OK -> {
+                        // Lekkie tłumienie – stabilnie, bez drgań podglądu.
+                        val delta = res.devToPano * devToPano.transposed()
+                        corr = (Mat3.exp(delta.log() * 0.8f) * corr).orthonormalized()
                         devToPano = corr * reference * r
-                        if (settings.autoGain && res.gain > 0f) gain += (res.gain - gain) * 0.3f
-                        ok = true
+                        alignedInternal = true
                         mismatch = 0
-                        if (settings.autoFov && res.ncc > 0.75f && ++fovChecks % 6 == 0) calibrateFov(devToPano, g)
                     }
-                    Align.Mismatch -> {
+                    AlignResult.Status.MISMATCH -> {
                         bad = true
                         mismatch++
                     }
-                    Align.NoOverlap -> mismatch = 0
+                    else -> mismatch = 0
                 }
-            } else if (settings.autoGain && hasContentInternal) {
-                val gEst = gainEstimate(devToPano, g)
-                if (gEst > 0f) gain += (gEst - gain) * 0.3f
             }
-            if (!settings.autoGain) gain = 1f
-            gain = gain.coerceIn(0.6f, 1.6f)
-            alignedInternal = ok
 
+            // 2) Czy to kandydat do zszycia.
             val forward = devToPano.transform(Vec3(0f, 0f, -1f))
             curHint = Hint.NONE
+            var candidate = false
+            var pointTarget: Target? = null
             if (recording) {
+                val reject = bad && mismatch < 45
                 when (settings.mode) {
                     CaptureMode.CONTINUOUS -> {
-                        // Klatka sprzeczna z tym, co już zszyte, nie jest malowana (chyba że
-                        // niezgodność trwa długo – wtedy scena się zmieniła i trzeba ją przyjąć).
-                        val reject = bad && mismatch < 45
-                        doStitch = spd < settings.maxSpeed && !reject
-                        if (spd >= settings.maxSpeed) curHint = Hint.TOO_FAST else if (reject) curHint = Hint.NO_MATCH
+                        val step = 2f * atan(tanX) * KEYFRAME_STEP
+                        candidate = !tooFast && !reject && policy.wants(devToPano, quality, nowMs, step)
+                        curHint = when {
+                            tooFast -> Hint.TOO_FAST
+                            reject -> Hint.NO_MATCH
+                            else -> Hint.NONE
+                        }
                     }
                     CaptureMode.POINTS -> {
-                        val ts2 = targets
-                        val near = ts2.filter { !it.done }.minByOrNull { angleBetween(it.dir, forward) }
+                        val near = targets.filter { !it.done }.minByOrNull { angleBetween(it.dir, forward) }
                         if (near == null) {
                             curHint = Hint.DONE
-                        } else {
-                            val ang = angleBetween(near.dir, forward) / DEG
-                            if (ang < 3.5f) {
-                                if (spd < 14f) dwell++ else dwell = 0
-                                curHint = if (spd < 14f) Hint.HOLD else Hint.TOO_FAST
-                                if (dwell >= 4 && (!bad || dwell >= 20)) {
-                                    doStitch = true
-                                    near.done = true
-                                    dwell = 0
-                                    pointHit = true
-                                    allDone = ts2.all { it.done }
-                                }
-                            } else {
-                                dwell = 0
-                                curHint = Hint.AIM
+                        } else if (angleBetween(near.dir, forward) / DEG < 3.5f) {
+                            val still = blurPx < BLUR_MAX * 0.6f
+                            if (still) dwell++ else dwell = 0
+                            curHint = if (still) Hint.HOLD else Hint.TOO_FAST
+                            if (dwell >= 3 && (!bad || dwell >= 20)) {
+                                candidate = true
+                                pointTarget = near
                             }
+                        } else {
+                            dwell = 0
+                            curHint = if (tooFast) Hint.TOO_FAST else Hint.AIM
                         }
                     }
                 }
@@ -352,56 +394,129 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 curHint = if (hasContentInternal) Hint.PAUSED else Hint.READY
             }
 
-            if (doStitch) {
-                val panoToCam = devToPano.transposed()
-                val border = borderDirs(devToPano)
-                val poleInside = poleVisible(panoToCam)
-                low.splat(g, panoToCam, tanX, tanY, gain, blend, feather, LonLatBox.of(border, forward, low.w, low.h, poleInside))
-                hasContentInternal = true
-                stitchedSinceCoverage++
+            // 3) Klatka kluczowa: dokładne dopasowanie, test ostrości, fotometria, zszycie.
+            if (candidate) {
+                val fw = (2f * atan(tanX) / (FINE_DEG * DEG)).roundToInt().coerceIn(240, 720)
+                val fh = (fw * uh / uw).coerceAtLeast(8)
+                val fg = if (fineGray.w == fw && fineGray.h == fh) fineGray else GrayFrame(fw, fh).also { fineGray = it }
+                GrayFrame.fromLuma(yPlane.buffer, yPlane.rowStride, w, h, rot, fg)
+                val samples = SampleSet.textured(fg, 6, 3000)
+                var accept = true
+                if (hasContentInternal && fg.contrast > 0.015f) {
+                    val estimateFov = keyframes > 4 && keyframes % 3 == 0
+                    val res = Aligner.refine(fine, samples, geom, devToPano, estimateFov)
+                    when (res.status) {
+                        AlignResult.Status.OK -> {
+                            devToPano = res.devToPano
+                            corr = (devToPano * (reference * r).transposed()).orthonormalized()
+                            alignedInternal = true
+                            mismatch = 0
+                            sync.add(corr, (corr * reference).transform(wWorld), tc)
+                            if (estimateFov) {
+                                fov.add(res.fovScale, res.ncc)
+                                fovAuto = fov.scale
+                                tanX = baseTanX * fovAuto
+                                tanY = baseTanY * fovAuto
+                            }
+                        }
+                        AlignResult.Status.MISMATCH -> {
+                            mismatch++
+                            if (mismatch < 45) accept = false
+                        }
+                        else -> Unit
+                    }
+                    // Klatka mniej ostra niż to, co już leży w tym miejscu – odrzucamy.
+                    if (accept && res.overlap > 0.3f) {
+                        val ratio = Sharpness.relative(fine, fg, geom, devToPano)
+                        if (ratio in 0f..SHARP_MIN) {
+                            accept = false
+                            blurryReject = true
+                        }
+                    }
+                }
+                if (accept) {
+                    if (hasContentInternal) {
+                        val st = Aligner.photometry(fine, samples, geom, devToPano, vignette.k)
+                        if (st.gain > 0f) gain += (st.gain.coerceIn(0.5f, 2f) - gain) * 0.5f
+                        vignette.add(st)
+                    }
+                    gain = gain.coerceIn(0.5f, 2f)
+                    val panoToCam = devToPano.transposed()
+                    val photo = Photometry(gain, vignette.k)
+                    val border = borderDirs(devToPano, geom)
+                    val fwd = devToPano.transform(Vec3(0f, 0f, -1f))
+                    val pole = poleVisible(panoToCam)
+                    coarse.splat(g, panoToCam, geom, photo, quality, LonLatBox.of(border, fwd, coarse.w, coarse.h, pole))
+                    fine.splat(fg, panoToCam, geom, photo, quality, LonLatBox.of(border, fwd, fine.w, fine.h, pole))
+                    hasContentInternal = true
+                    stitchedSinceCoverage++
+                    keyframes++
+                    policy.accepted(devToPano, quality, nowMs)
+                    doStitch = true
+                    pointTarget?.let {
+                        it.done = true
+                        dwell = 0
+                        pointHit = true
+                        allDone = targets.all { t -> t.done }
+                    }
+                } else if (blurryReject) {
+                    blurryUntil = nowMs + 900
+                }
             }
+            if (recording && nowMs < blurryUntil && curHint != Hint.TOO_FAST) curHint = Hint.BLURRY
         }
 
-        // Przekazanie do GPU (podgląd na żywo + ewentualne zszycie).
+        // Przekazanie do GPU: zszywana klatka zawsze, podglądowa tylko gdy renderer nadąża.
         val f = frame
         synchronized(frameLock) {
-            val deadline = SystemClock.uptimeMillis() + 80
-            while (f.ready && SystemClock.uptimeMillis() < deadline) frameLock.wait(10)
-            f.ensure(w, h)
-            f.rotation = rot
-            copyRgba(src, rowStride, w, h, f.buf)
-            devToPano.transposed().toGl(f.panoToCam)
-            f.tanX = tanX
-            f.tanY = tanY
-            f.gain = gain
-            f.blend = blend
-            f.feather = feather
-            f.vignette = settings.vignette
-            f.stitch = doStitch
             if (doStitch) {
-                val panoToCam = devToPano.transposed()
-                f.box = LonLatBox.of(borderDirs(devToPano), devToPano.transform(Vec3(0f, 0f, -1f)), canvasW, canvasW / 2, poleVisible(panoToCam))
+                val deadline = SystemClock.uptimeMillis() + 500
+                while (f.ready && SystemClock.uptimeMillis() < deadline) frameLock.wait(5)
             }
-            f.ready = true
+            if (!f.ready) {
+                val up = image.planes[1]; val vp = image.planes[2]
+                f.y.copyFrom(yPlane.buffer, yPlane.rowStride, 1, w, h)
+                f.u.copyFrom(up.buffer, up.rowStride, up.pixelStride, w / 2, h / 2)
+                f.v.copyFrom(vp.buffer, vp.rowStride, vp.pixelStride, w / 2, h / 2)
+                f.rotation = rot
+                devToPano.transposed().toGl(f.panoToCam)
+                f.tanX = geom.tanX
+                f.tanY = geom.tanY
+                f.gain = gain
+                f.vignette = vignette.k
+                f.omega[0] = wDev.x; f.omega[1] = wDev.y; f.omega[2] = wDev.z
+                f.skew = geom.skew
+                f.quality = quality
+                f.stitch = doStitch
+                if (doStitch) {
+                    f.box = LonLatBox.of(borderDirs(devToPano, geom), devToPano.transform(Vec3(0f, 0f, -1f)), canvasW, canvasW / 2, poleVisible(devToPano.transposed()))
+                }
+                f.ready = true
+            }
         }
 
-        val nowMs = SystemClock.uptimeMillis()
-        val publishCoverage = stitchedSinceCoverage >= 6 || (doStitch && settings.mode == CaptureMode.POINTS)
-        val cov = if (publishCoverage) synchronized(low) { low.coverage(settings.range) } else -1f
+        if (recording && (tooFast || blurryReject) && nowMs - lastWarnMs > 1200) {
+            lastWarnMs = nowMs
+            main.post { onMotionWarning?.invoke() }
+        }
+        val publishCoverage = stitchedSinceCoverage >= 3 || (doStitch && settings.mode == CaptureMode.POINTS)
+        val cov = if (publishCoverage) synchronized(lock) { coarse.coverage(settings.range) } else -1f
         if (publishCoverage) stitchedSinceCoverage = 0
-        if (doStitch || nowMs - lastUi > 120 || pointHit) {
+        if (doStitch || blurryReject || nowMs - lastUi > 100 || pointHit) {
             lastUi = nowMs
             val al = alignedInternal
-            val gn = gain
+            val bl = blurPx / BLUR_MAX
             main.post {
                 speed = spd
+                speedLimit = limitDeg
+                blurLevel = if (recording) bl else bl.coerceAtMost(1f)
                 if (curHint != Hint.NONE || hint != Hint.PAUSED) hint = curHint
                 aligned = al
-                exposureGain = gn
                 if (doStitch) {
                     stitched++
                     hasContent = true
                 }
+                if (blurryReject) rejected++
                 if (cov >= 0f) coverage = cov
                 if (pointHit) {
                     targetsDone = targets.count { it.done }
@@ -410,14 +525,11 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 if (allDone) {
                     hint = Hint.DONE
                     onAllPointsDone?.invoke()
-                    if (settings.autoFinish) pause()
+                    pause()
                 }
             }
         }
     }
-
-    @Volatile private var hasContentInternal = false
-    @Volatile private var alignedInternal = false
 
     /** Renderer zużył klatkę. */
     fun frameConsumed() {
@@ -434,14 +546,14 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         main.post { hint = h }
     }
 
-    private fun borderDirs(devToPano: Mat3): List<Vec3> {
-        val out = ArrayList<Vec3>(16)
-        for (i in 0..3) {
-            val t = i / 3f * 2f - 1f
-            out += devToPano.transform(Vec3(t * tanX, tanY, -1f).normalized())
-            out += devToPano.transform(Vec3(t * tanX, -tanY, -1f).normalized())
-            out += devToPano.transform(Vec3(tanX, t * tanY, -1f).normalized())
-            out += devToPano.transform(Vec3(-tanX, t * tanY, -1f).normalized())
+    private fun borderDirs(devToPano: Mat3, geom: FrameGeom): List<Vec3> {
+        val out = ArrayList<Vec3>(32)
+        for (i in 0..7) {
+            val t = i / 7f * 2f - 1f
+            out += devToPano.transform(geom.rayAt(t * geom.tanX, geom.tanY).normalized())
+            out += devToPano.transform(geom.rayAt(t * geom.tanX, -geom.tanY).normalized())
+            out += devToPano.transform(geom.rayAt(geom.tanX, t * geom.tanY).normalized())
+            out += devToPano.transform(geom.rayAt(-geom.tanX, t * geom.tanY).normalized())
         }
         return out
     }
@@ -458,228 +570,17 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         return false
     }
 
-    // ── Dopasowanie obrazem ─────────────────────────────────────────────────
-
-    private class Samples(val dirs: Array<Vec3>, val vals: FloatArray, val coarse: IntArray)
-
-    private var samples: Samples? = null
-    private var samplesKey = ""
-
-    private fun samplesFor(g: GrayFrame): Samples {
-        val key = "${g.w}x${g.h}:$tanX:$tanY"
-        samples?.let { if (samplesKey == key) return it.also { s -> fillVals(s, g) } }
-        val step = 3
-        val list = ArrayList<Vec3>()
-        val coarse = ArrayList<Int>()
-        var y = 2
-        var row = 0
-        while (y < g.h - 2) {
-            var x = 2
-            var col = 0
-            while (x < g.w - 2) {
-                if (row % 2 == 0 && col % 2 == 0) coarse += list.size
-                col++
-                val u = (x + 0.5f) / g.w
-                val v = (y + 0.5f) / g.h
-                list += Vec3((2 * u - 1) * tanX, (1 - 2 * v) * tanY, -1f).normalized()
-                x += step
-            }
-            y += step
-            row++
-        }
-        val s = Samples(list.toTypedArray(), FloatArray(list.size), coarse.toIntArray())
-        samples = s
-        samplesKey = key
-        fillVals(s, g)
-        return s
-    }
-
-    private fun fillVals(s: Samples, g: GrayFrame) {
-        for (i in s.dirs.indices) {
-            val d = s.dirs[i]
-            val u = 0.5f + 0.5f * (d.x / -d.z) / tanX
-            val v = 0.5f - 0.5f * (d.y / -d.z) / tanY
-            s.vals[i] = g.sample(u, v)
-        }
-    }
-
-    /** Wynik: (1 − NCC, udział próbek w zakładce, wzmocnienie). [idx] – podzbiór próbek albo null. */
-    private fun score(rot: Mat3, s: Samples, idx: IntArray? = null): FloatArray {
-        var n = 0
-        var sf = 0.0; var sc = 0.0; var sff = 0.0; var scc = 0.0; var sfc = 0.0
-        val m = rot.m
-        val total = idx?.size ?: s.dirs.size
-        for (k in 0 until total) {
-            val i = idx?.get(k) ?: k
-            val d = s.dirs[i]
-            val c = low.sample(
-                Vec3(
-                    m[0] * d.x + m[1] * d.y + m[2] * d.z,
-                    m[3] * d.x + m[4] * d.y + m[5] * d.z,
-                    m[6] * d.x + m[7] * d.y + m[8] * d.z,
-                ),
-            )
-            if (c.isNaN()) continue
-            val f = s.vals[i].toDouble()
-            n++
-            sf += f; sc += c; sff += f * f; scc += c * c; sfc += f * c
-        }
-        if (n < 20) return floatArrayOf(2f, n.toFloat() / total, 0f)
-        val mf = sf / n; val mc = sc / n
-        val vf = sff / n - mf * mf
-        val vc = scc / n - mc * mc
-        val cov = sfc / n - mf * mc
-        val ncc = if (vf > 1e-6 && vc > 1e-6) cov / sqrt(vf * vc) else 0.0
-        val gEst = if (mf > 0.02) (mc / mf).toFloat() else 0f
-        return floatArrayOf((1 - ncc).toFloat(), n.toFloat() / total, gEst)
-    }
-
-    private fun gainEstimate(devToPano: Mat3, g: GrayFrame): Float {
-        val s = samplesFor(g)
-        val r = score(devToPano, s)
-        return if (r[1] > 0.2f) r[2] else 0f
-    }
-
-    private sealed class Align {
-        class Ok(val corr: Mat3, val gain: Float, val ncc: Float) : Align()
-        data object Mismatch : Align()
-        data object NoOverlap : Align()
-    }
-
-    /**
-     * Szuka obrotu (yaw, pitch, roll do ±4°) najlepiej zgadzającego klatkę z panoramą.
-     * Zgrubnie na co czwartej próbce, potem coraz drobniej na wszystkich (piramida kroków
-     * 1° → 0,5° → 0,25°). Miarą jest znormalizowana korelacja (odporna na zmiany jasności).
-     */
-    private fun align(devToPano: Mat3, g: GrayFrame): Align {
-        val s = samplesFor(g)
-        val base = score(devToPano, s)
-        if (base[1] < 0.2f) return Align.NoOverlap
-        val forward = devToPano.transform(Vec3(0f, 0f, -1f))
-        val right = forward.cross(Vec3(0f, 0f, 1f)).let { if (it.length() < 1e-3f) Vec3(1f, 0f, 0f) else it.normalized() }
-
-        fun delta(yaw: Float, pitch: Float, roll: Float): Mat3 =
-            Mat3.axisAngle(forward, roll * DEG) * Mat3.rotZ(yaw * DEG) * Mat3.axisAngle(right, pitch * DEG)
-
-        var bY = 0f; var bP = 0f; var bR = 0f
-        var best = score(devToPano, s, s.coarse)
-        fun tryAt(y: Float, p: Float, r: Float, idx: IntArray?): Boolean {
-            val sc = score(delta(y, p, r) * devToPano, s, idx)
-            if (sc[1] >= 0.2f && sc[0] < best[0]) {
-                best = sc; bY = y; bP = p; bR = r
-                return true
-            }
-            return false
-        }
-        // 1) Zgrubnie: yaw × pitch co 1°.
-        for (y in -4..4) for (p in -4..4) if (y != 0 || p != 0) tryAt(y.toFloat(), p.toFloat(), 0f, s.coarse)
-        // 2) Przechył co 1° w najlepszym miejscu.
-        run {
-            val y0 = bY; val p0 = bP
-            for (r in -3..3) if (r != 0) tryAt(y0, p0, r.toFloat(), s.coarse)
-        }
-        // 3) Wszystkie próbki: ±0,5° we wszystkich osiach.
-        best = score(delta(bY, bP, bR) * devToPano, s)
-        run {
-            val y0 = bY; val p0 = bP; val r0 = bR
-            for (dy in -1..1) for (dp in -1..1) for (dr in -1..1) {
-                if (dy == 0 && dp == 0 && dr == 0) continue
-                tryAt(y0 + dy * 0.5f, p0 + dp * 0.5f, r0 + dr * 0.5f, null)
-            }
-        }
-        // 4) Doszlifowanie co 0,25°.
-        run {
-            val y0 = bY; val p0 = bP
-            for (dy in -1..1) for (dp in -1..1) if (dy != 0 || dp != 0) tryAt(y0 + dy * 0.25f, p0 + dp * 0.25f, bR, null)
-        }
-        val ncc = 1f - best[0]
-        // Wyraźna sprzeczność w dużej zakładce – klatka nie pasuje (ruch, paralaksa, błąd czujnika).
-        if (ncc < 0.35f && best[1] > 0.4f) return Align.Mismatch
-        // Słaba zgodność (gładka ściana) – nie ruszamy pozy, ale klatkę można przyjąć.
-        if (ncc < 0.6f) return Align.NoOverlap
-        if (bY == 0f && bP == 0f && bR == 0f) return Align.Ok(corr, best[2], ncc)
-        // Lekkie tłumienie – stabilnie, bez drgań.
-        return Align.Ok(delta(bY * 0.8f, bP * 0.8f, bR * 0.8f) * corr, best[2], ncc)
-    }
-
-    /**
-     * Samokalibracja kąta widzenia: błędny kąt rozjeżdża szwy coraz bardziej ku brzegom kadru.
-     * Porównujemy zgodność dla kadru o 2% węższego i szerszego i powoli przesuwamy poprawkę
-     * w lepszą stronę (w granicach ±12% danych producenta).
-     */
-    private fun calibrateFov(devToPano: Mat3, g: GrayFrame) {
-        val s = samplesFor(g)
-        fun scoreAt(k: Float): Float {
-            val dirs = Array(s.dirs.size) { i ->
-                val d = s.dirs[i]
-                Vec3(d.x / -d.z * k, d.y / -d.z * k, -1f).normalized()
-            }
-            return score(devToPano, Samples(dirs, s.vals, s.coarse))[0]
-        }
-        val mid = scoreAt(1f)
-        val narrow = scoreAt(0.98f)
-        val wide = scoreAt(1.02f)
-        val step = when {
-            wide < mid - 0.002f && wide <= narrow -> 0.004f
-            narrow < mid - 0.002f && narrow < wide -> -0.004f
-            else -> 0f
-        }
-        if (step == 0f) return
-        fovAuto = (fovAuto + step).coerceIn(0.88f, 1.12f)
-        tanX = baseTanX * fovAuto
-        tanY = baseTanY * fovAuto
-    }
-
-    // ── Konwersje pikseli ───────────────────────────────────────────────────
-
-    /** Szary obraz w orientacji pionowej; [rot] – obrót bufora zgodnie ze wskazówkami zegara. */
-    private fun makeGray(src: ByteBuffer, rowStride: Int, w: Int, h: Int, rot: Int, g: GrayFrame) {
-        for (y in 0 until g.h) {
-            val v = (y + 0.5f) / g.h
-            for (x in 0 until g.w) {
-                val u = (x + 0.5f) / g.w
-                // (u, v) w obrazie pionowym → (s, t) w buforze (oba z osią y w dół).
-                val bs: Float
-                val bt: Float
-                when (rot) {
-                    90 -> { bs = v; bt = 1f - u }
-                    180 -> { bs = 1f - u; bt = 1f - v }
-                    270 -> { bs = 1f - v; bt = u }
-                    else -> { bs = u; bt = v }
-                }
-                val px = (bs * w).toInt().coerceIn(0, w - 2)
-                val py = (bt * h).toInt().coerceIn(0, h - 2)
-                var acc = 0f
-                for (oy in 0..1) for (ox in 0..1) {
-                    val i = (py + oy) * rowStride + (px + ox) * 4
-                    val rr = src.get(i).toInt() and 0xFF
-                    val gg = src.get(i + 1).toInt() and 0xFF
-                    val bb = src.get(i + 2).toInt() and 0xFF
-                    acc += 0.299f * rr + 0.587f * gg + 0.114f * bb
-                }
-                g.px[y * g.w + x] = acc / (4f * 255f)
-            }
-        }
-        g.computeStats()
-    }
-
-    private fun copyRgba(src: ByteBuffer, rowStride: Int, w: Int, h: Int, dst: ByteBuffer) {
-        dst.clear()
-        val row = w * 4
-        if (rowStride == row) {
-            val dup = src.duplicate()
-            dup.position(0)
-            dup.limit(row * h)
-            dst.put(dup)
-        } else {
-            val dup = src.duplicate()
-            for (y in 0 until h) {
-                dup.limit(y * rowStride + row)
-                dup.position(y * rowStride)
-                dst.put(dup)
-            }
-        }
-        dst.flip()
+    private companion object {
+        const val GRAY_W = 160
+        /** Rozdzielczość odniesienia do dokładnego dopasowania (°/px). */
+        const val FINE_DEG = 0.1f
+        /** Dopuszczalne rozmycie ruchu (px) – powyżej klatka jest odrzucana. */
+        const val BLUR_MAX = 1.6f
+        /** Klatka mniej ostra niż ten ułamek tego, co już zszyte w tym miejscu, nie przechodzi. */
+        const val SHARP_MIN = 0.6f
+        /** Co jaki ułamek kąta widzenia zszywamy kolejną klatkę w malowaniu. */
+        const val KEYFRAME_STEP = 0.07f
+        const val POINT_OVERLAP = 0.35f
     }
 }
 
@@ -688,5 +589,5 @@ sealed class GlCommand {
     data object Clear : GlCommand()
     data object Snapshot : GlCommand()
     data object Restore : GlCommand()
-    class Export(val request: ExportRequest) : GlCommand()
+    class Export(val export: com.blacksingularities.open360.gl.CanvasExport) : GlCommand()
 }

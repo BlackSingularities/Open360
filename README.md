@@ -5,13 +5,14 @@ Panoramy 360° na żywo z aparatu telefonu (Android 10+). Wodzisz telefonem, a s
 ## Możliwości
 
 - **Podgląd na żywo** – kadr kamery nałożony na rosnącą panoramę, siatka sfery w pustych miejscach, poziomica.
-- **Zszywanie na GPU** (OpenGL ES 3) do płótna równoprostokątnego 2K–8K.
-- **Łączenie klatek**: najostrzejsza, miękkie przenikanie (średnia ważona odległością od brzegu kadru), tylko puste miejsca, nadpisywanie.
-- **Korekta obrazem** – każda klatka jest dopasowywana (NCC) do już zszytej panoramy, co usuwa dryf żyroskopu.
-- **Wyrównanie ekspozycji**, blokada AE/AWB, korekta winietowania, kompensacja EV, obiektyw szerokokątny.
+- **Zszywanie na GPU** (OpenGL ES 3) do płótna równoprostokątnego 2K–16K (16K w kafelkach, zapis strumieniowy).
+- **Tylko ostre klatki** – rozmycie liczone z ruchu i czasu naświetlania oraz mierzone w obrazie; rozmazane klatki są odrzucane, a pasek tempa, komunikaty i wibracja ostrzegają przed zbyt szybkim ruchem.
+- **Dokładne dopasowanie** – zgrubne przeszukanie (NCC) i Gauss-Newton na sferze: obrót, skala ogniskowej i jasność, dokładność ułamka piksela; korekta migawki szczelinowej.
+- **Czyste szwy** – każdy fragment z klatki, w której był najbliżej środka kadru, wąskie przenikanie, bez duchów.
+- **Automatyka** – krótszy czas naświetlania podczas zbierania, blokada ekspozycji, bieli i ostrości, wyrównanie ekspozycji i winietowania, kalibracja kąta widzenia i opóźnienia czujnika, wybór klatek kluczowych, kadrowanie, wypełnianie dziur i wyostrzanie.
 - **Tryby**: malowanie albo punkty (siatka celów, automatyczne zdjęcie po ustabilizowaniu kadru).
 - **Zakresy**: pełna sfera, bez nadiru, pas horyzontu, pół panoramy.
-- **Eksport** JPEG z metadanymi GPano (Google Zdjęcia, Facebook), wypełnianie dziur, kadrowanie do treści.
+- **Eksport** JPEG z metadanymi GPano (Google Zdjęcia, Facebook).
 - **Przeglądarka**: perspektywa, mała planeta, tunel, mapa; rozglądanie telefonem, automatyczny obrót, tryb VR, zapis widoku jako zdjęcia.
 
 ## Budowanie

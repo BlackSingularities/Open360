@@ -8,7 +8,10 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -30,6 +33,39 @@ object PanoStore {
     private const val FOLDER = "Open360"
     private val XMP_HEADER = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray(Charsets.ISO_8859_1)
 
+    /**
+     * Zapis strumieniowy: [write] dostaje strumień pliku w galerii (np. koder JPEG piszący
+     * pasami). Błąd w [write] usuwa niedokończony plik.
+     */
+    fun saveStreaming(context: Context, width: Int, height: Int, prefix: String = "PANO", write: (OutputStream) -> Unit): Uri? {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, fileName(prefix))
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/" + FOLDER)
+            put(MediaStore.Images.Media.WIDTH, width)
+            put(MediaStore.Images.Media.HEIGHT, height)
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            resolver.openOutputStream(uri)?.use { raw -> BufferedOutputStream(raw, 1 shl 20).use { write(it) } } ?: error("brak strumienia")
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            uri
+        } catch (t: Throwable) {
+            Log.e("Open360", "zapis", t)
+            resolver.delete(uri, null, null)
+            null
+        }
+    }
+
+    /** Ładunek segmentu APP1 z metadanymi GPano (dla kodera JPEG). */
+    fun xmpPayload(g: PanoGeometry): ByteArray = XMP_HEADER + xmp(g).toByteArray(Charsets.UTF_8)
+
+    private fun fileName(prefix: String) = prefix + "_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+
     fun save(
         context: Context,
         bmp: Bitmap,
@@ -42,7 +78,7 @@ object PanoStore {
             out.toByteArray()
         }
         val data = if (geometry != null) insertXmp(bytes, xmp(geometry)) else bytes
-        val name = prefix + "_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+        val name = fileName(prefix)
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
