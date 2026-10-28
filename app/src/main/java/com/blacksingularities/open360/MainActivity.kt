@@ -1,6 +1,8 @@
 package com.blacksingularities.open360
 
 import android.Manifest
+import android.app.Activity
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -39,6 +41,9 @@ class MainActivity : ComponentActivity() {
     private var screen by mutableStateOf<Screen>(Screen.Home)
     private var refresh by mutableIntStateOf(0)
 
+    /** Inna aplikacja (np. przeglądarka) prosi o wybranie pliku – wynik wraca do niej. */
+    private var picking by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(SystemBarStyle.dark(android.graphics.Color.TRANSPARENT), SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
@@ -72,14 +77,20 @@ class MainActivity : ComponentActivity() {
                                     permission.launch(Manifest.permission.CAMERA)
                                 }
                             },
-                            onOpen = { uri, own -> screen = Screen.Viewer(uri, own) },
+                            onOpen = { uri, own -> if (picking) deliver(uri) else screen = Screen.Viewer(uri, own) },
+                            picking = picking,
+                            onCancel = { finish() },
                         )
                         Screen.Capture -> CaptureScreen(
                             settings,
                             onClose = { screen = Screen.Home },
                             onSaved = { uri ->
-                                refresh++
-                                screen = Screen.Viewer(uri, own = true, fromCapture = true)
+                                if (picking) {
+                                    deliver(uri)
+                                } else {
+                                    refresh++
+                                    screen = Screen.Viewer(uri, own = true, fromCapture = true)
+                                }
                             },
                         )
                         is Screen.Viewer -> ViewerScreen(
@@ -102,11 +113,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_GET_CONTENT || intent?.action == Intent.ACTION_PICK) {
+            picking = true
+            screen = Screen.Home
+            return
+        }
         val uri = when (intent?.action) {
             Intent.ACTION_VIEW -> intent.data
             Intent.ACTION_SEND -> IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
             else -> null
         } ?: return
         screen = Screen.Viewer(uri, own = false)
+    }
+
+    /** Zwraca wybraną panoramę aplikacji, która prosiła o plik, z prawem do odczytu. */
+    private fun deliver(uri: Uri) {
+        val result = Intent()
+            .setDataAndType(uri, "image/jpeg")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        result.clipData = ClipData.newRawUri(null, uri)
+        setResult(Activity.RESULT_OK, result)
+        finish()
     }
 }

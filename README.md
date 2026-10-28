@@ -12,6 +12,7 @@ Panoramy 360° na żywo z aparatu telefonu (Android 10+). Wodzisz telefonem, a s
 - **Tryby**: malowanie albo punkty (siatka celów, automatyczne zdjęcie po ustabilizowaniu kadru).
 - **Zakresy**: pełna sfera, bez nadiru, pas horyzontu, pół panoramy.
 - **Eksport** JPEG z metadanymi GPano (Google Zdjęcia, Facebook), wypełnianie dziur, kadrowanie do treści.
+- **Wybór pliku dla innych aplikacji** – przy przesyłaniu zdjęcia w przeglądarce (lub gdziekolwiek trzeba wybrać plik) można wskazać panoramę z Open360 albo zrobić nową.
 - **Przeglądarka**: perspektywa, mała planeta, tunel, mapa; rozglądanie telefonem, automatyczny obrót, tryb VR, zapis widoku jako zdjęcia.
 
 ## Budowanie

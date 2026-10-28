@@ -28,6 +28,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CameraAlt
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Settings
@@ -69,6 +70,8 @@ fun HomeScreen(
     refreshKey: Int,
     onCapture: () -> Unit,
     onOpen: (Uri, Boolean) -> Unit,
+    picking: Boolean = false,
+    onCancel: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
@@ -80,7 +83,7 @@ fun HomeScreen(
         items = withContext(Dispatchers.IO) { PanoStore.list(context) }
     }
     LaunchedEffect(settings.updates) {
-        if (settings.updates) update = Updates.check()
+        if (settings.updates && !picking) update = Updates.check()
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) onOpen(uri, false)
@@ -96,7 +99,11 @@ fun HomeScreen(
                 Image(painterResource(R.drawable.brand_monochrome), null, Modifier.size(44.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("Open360", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                RoundButton(Icons.Outlined.Settings, "Ustawienia", background = Color.Transparent) { showSettings = true }
+                if (picking) {
+                    RoundButton(Icons.Outlined.Close, "Anuluj", background = Color.Transparent) { onCancel() }
+                } else {
+                    RoundButton(Icons.Outlined.Settings, "Ustawienia", background = Color.Transparent) { showSettings = true }
+                }
             }
         }
         item {
@@ -107,18 +114,24 @@ fun HomeScreen(
                     .background(Palette.PanelHigh)
                     .padding(20.dp),
             ) {
-                Text("Panorama 360° na żywo", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text(if (picking) "Wybierz panoramę" else "Panorama 360° na żywo", fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Wodź telefonem – sfera wypełnia się na ekranie w czasie rzeczywistym. " +
-                        "Pełna sfera, pas horyzontu albo dowolny fragment.",
+                    if (picking) {
+                        "Dotknij zapisanej panoramy, aby ją przesłać, albo zrób nową – po zapisaniu trafi od razu do aplikacji, która prosi o plik."
+                    } else {
+                        "Wodź telefonem – sfera wypełnia się na ekranie w czasie rzeczywistym. " +
+                            "Pełna sfera, pas horyzontu albo dowolny fragment."
+                    },
                     color = Palette.TextDim, fontSize = 14.sp,
                 )
                 Spacer(Modifier.height(16.dp))
                 PrimaryButton("Nowa panorama", Icons.Outlined.CameraAlt, Modifier.fillMaxWidth()) { onCapture() }
-                Spacer(Modifier.height(10.dp))
-                OutlineButton("Otwórz zdjęcie 360°", Icons.Outlined.PhotoLibrary, Modifier.fillMaxWidth()) {
-                    picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                if (!picking) {
+                    Spacer(Modifier.height(10.dp))
+                    OutlineButton("Otwórz zdjęcie 360°", Icons.Outlined.PhotoLibrary, Modifier.fillMaxWidth()) {
+                        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    }
                 }
             }
         }
