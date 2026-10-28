@@ -95,6 +95,12 @@ class CameraController(
                 metaHead = (metaHead + 1) % metaSize
             }
             if (!locked) lastMeta = m
+            result.get(android.hardware.camera2.CaptureResult.LENS_FOCAL_LENGTH)?.let { f ->
+                if (f > 0f && f != lastFocal) {
+                    lastFocal = f
+                    mainHandler.post { checkFocal(f) }
+                }
+            }
         }
     }
 
@@ -169,7 +175,10 @@ class CameraController(
         val outLong = max(res.width, res.height).toFloat()
         val outShort = min(res.width, res.height).toFloat()
 
-        val focal = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 4.3f
+        // Aparat z kilkoma obiektywami (logiczny) podaje listę ogniskowych – bierzemy tę
+        // najbliższą typowej głównej; faktyczną poprawia potem wynik pierwszych klatek.
+        val focals = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+        val focal = focals?.minByOrNull { abs(it - (lastFocal ?: 5f)) } ?: 4.3f
         val phys = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val pixel = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
         val active = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
@@ -179,13 +188,9 @@ class CameraController(
             effW *= active.width().toFloat() / pixel.width
             effH *= active.height().toFloat() / pixel.height
         }
-        var tLong = max(effW, effH) / (2f * focal)
-        var tShort = min(effW, effH) / (2f * focal)
-        val outAspect = outLong / outShort
-        val sensorAspect = tLong / tShort
-        if (outAspect < sensorAspect) tLong = tShort * outAspect else tShort = tLong / outAspect
-        tLong /= ratio
-        tShort /= ratio
+        sensorW = effW; sensorH = effH; outLongPx = outLong; outShortPx = outShort; zoomRatio = ratio
+        usedFocal = focal
+        val (tShort, tLong) = tangents(focal)
 
         val ev = cam.cameraInfo.exposureState
         val range = ev.exposureCompensationRange
@@ -209,11 +214,46 @@ class CameraController(
         )
         info = i
         engine.setCamera(tShort, tLong, outShort.toInt())
+        lastFocal?.let { checkFocal(it) }
         onInfo?.invoke(i)
         setLocked(false)
     }
 
     private var distortionMode: Int? = null
+    private var sensorW = 5.6f
+    private var sensorH = 4.2f
+    private var outLongPx = 1440f
+    private var outShortPx = 1080f
+    private var zoomRatio = 1f
+    private var usedFocal = 0f
+    @Volatile private var lastFocal: Float? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** Połówkowe tangensy kąta widzenia (krótszy, dłuższy bok) dla ogniskowej [focal] mm. */
+    private fun tangents(focal: Float): Pair<Float, Float> {
+        var tLong = max(sensorW, sensorH) / (2f * focal)
+        var tShort = min(sensorW, sensorH) / (2f * focal)
+        val outAspect = outLongPx / outShortPx
+        if (outAspect < tLong / tShort) tLong = tShort * outAspect else tShort = tLong / outAspect
+        return Pair(tShort / zoomRatio, tLong / zoomRatio)
+    }
+
+    /** Ogniskowa z wyniku klatki różni się od przyjętej – przeliczamy kąt widzenia. */
+    private fun checkFocal(f: Float) {
+        val cur = info ?: return
+        if (usedFocal <= 0f || abs(f - usedFocal) / usedFocal < 0.02f) return
+        usedFocal = f
+        val (tShort, tLong) = tangents(f)
+        val i = cur.copy(
+            tanX = tShort,
+            tanY = tLong,
+            fovH = Math.toDegrees(2.0 * kotlin.math.atan(tShort.toDouble())).toFloat(),
+            fovV = Math.toDegrees(2.0 * kotlin.math.atan(tLong.toDouble())).toFloat(),
+        )
+        info = i
+        engine.setCamera(tShort, tLong, cur.frameW)
+        onInfo?.invoke(i)
+    }
 
     /**
      * Na czas zbierania: stała ekspozycja i biel (cała panorama w jednym świetle), ostrość

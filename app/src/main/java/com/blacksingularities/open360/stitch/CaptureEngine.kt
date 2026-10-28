@@ -58,8 +58,6 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         private set
     @Volatile var tanY = 0.73f
         private set
-    private var baseTanX = 0.55f
-    private var baseTanY = 0.73f
     private var frameShort = 1080
     @Volatile var timestampsRealtime = true
 
@@ -78,7 +76,9 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     // Referencja kierunku (yaw startowy) i korekta dryfu z dopasowania obrazem.
     @Volatile private var ref: Mat3? = null
-    @Volatile private var corr = Mat3.I
+    private val corrector = PoseCorrector()
+    private val corr: Mat3 get() = corrector.corr
+    private var lastCorrNs = 0L
 
     private val lock = Any()
     private val coarse = GrayCanvas(1440, 720)
@@ -102,7 +102,6 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     private val vignette = VignetteEstimator()
     private val sync = SyncEstimator()
-    private val fov = FovEstimator()
     private val policy = KeyframePolicy()
 
     val frame = StitchFrame()
@@ -147,15 +146,10 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     var onRecordingChanged: ((Boolean) -> Unit)? = null
     var onMotionWarning: (() -> Unit)? = null
 
-    @Volatile var fovAuto = 1f
-        private set
-
     fun setCamera(tanX: Float, tanY: Float, frameShort: Int) {
-        baseTanX = tanX
-        baseTanY = tanY
         this.frameShort = frameShort
-        this.tanX = tanX * fovAuto
-        this.tanY = tanY * fovAuto
+        this.tanX = tanX
+        this.tanY = tanY
         updateTargets()
         rebuildTargets()
     }
@@ -211,7 +205,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         synchronized(lock) {
             coarse.copyFrom(coarseUndo)
             fine.copyFrom(fineUndo)
-            corr = undoCorr
+            corrector.reset(undoCorr)
             targets.forEachIndexed { i, t -> t.done = undoTargets.getOrElse(i) { false } }
             hasContentInternal = undoCount > 0
             policy.reset()
@@ -230,7 +224,8 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             coarse.clear()
             fine.clear()
             ref = null
-            corr = Mat3.I
+            corrector.reset()
+            lastCorrNs = 0L
             gain = 1f
             keyframes = 0
             mismatch = 0
@@ -333,19 +328,19 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         synchronized(lock) {
             val reference = ref ?: referenceFor(r).also { ref = it }
             geom = FrameGeom(tanX, tanY, rot, skewNs / 1e9f, wDev)
-            devToPano = corr * reference * r
+            val gyroPose = reference * r
+            devToPano = corr * gyroPose
+            // Poza wskazana przez obraz (zgrubnie, potem dokładnie) – do korekty dryfu żyroskopu.
+            var imagePose: Mat3? = null
 
-            // 1) Zgrubna korekta dryfu – na każdej (nierozmazanej) klatce.
+            // 1) Zgrubne dopasowanie – na każdej (nierozmazanej) klatce.
             var bad = false
             alignedInternal = false
             if (hasContentInternal && g.contrast > 0.02f && blurPx < blurMax * 2.5f) {
                 val res = Aligner.coarse(coarse, SampleSet.dense(g, 3), geom, devToPano)
                 when (res.status) {
                     AlignResult.Status.OK -> {
-                        // Lekkie tłumienie – stabilnie, bez drgań podglądu.
-                        val delta = res.devToPano * devToPano.transposed()
-                        corr = (Mat3.exp(delta.log() * 0.8f) * corr).orthonormalized()
-                        devToPano = corr * reference * r
+                        imagePose = res.devToPano
                         alignedInternal = true
                         mismatch = 0
                     }
@@ -404,22 +399,21 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 GrayFrame.fromLuma(yPlane.buffer, yPlane.rowStride, w, h, rot, fg)
                 val samples = SampleSet.textured(fg, 6, 3000)
                 var accept = true
+                // Poza najlepiej pasująca do obrazu – do pomiarów (ostrość, ekspozycja).
+                var fitPose = devToPano
                 if (hasContentInternal && fg.contrast > 0.015f) {
-                    val estimateFov = keyframes > 4 && keyframes % 3 == 0
-                    val res = Aligner.refine(fine, samples, geom, devToPano, estimateFov)
+                    val res = Aligner.refine(fine, samples, geom, imagePose ?: devToPano)
                     when (res.status) {
                         AlignResult.Status.OK -> {
-                            devToPano = res.devToPano
-                            corr = (devToPano * (reference * r).transposed()).orthonormalized()
+                            imagePose = res.devToPano
+                            fitPose = res.devToPano
                             alignedInternal = true
                             mismatch = 0
-                            sync.add(corr, (corr * reference).transform(wWorld), tc)
-                            if (estimateFov) {
-                                fov.add(res.fovScale, res.ncc)
-                                fovAuto = fov.scale
-                                tanX = baseTanX * fovAuto
-                                tanY = baseTanY * fovAuto
-                            }
+                            val deviation = res.devToPano * gyroPose.transposed()
+                            sync.add(deviation, (corr * reference).transform(wWorld), tc)
+                            // Zszywamy w pozie z żyroskopu z korektą dryfu i małym, lokalnym
+                            // dosunięciem do obrazu – paralaksa nie może się sumować.
+                            devToPano = corrector.stitchPose(deviation, gyroPose)
                         }
                         AlignResult.Status.MISMATCH -> {
                             mismatch++
@@ -429,7 +423,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                     }
                     // Klatka mniej ostra niż to, co już leży w tym miejscu – odrzucamy.
                     if (accept && res.overlap > 0.3f) {
-                        val ratio = Sharpness.relative(fine, fg, geom, devToPano)
+                        val ratio = Sharpness.relative(fine, fg, geom, fitPose)
                         if (ratio in 0f..SHARP_MIN) {
                             accept = false
                             blurryReject = true
@@ -438,7 +432,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 }
                 if (accept) {
                     if (hasContentInternal) {
-                        val st = Aligner.photometry(fine, samples, geom, devToPano, vignette.k)
+                        val st = Aligner.photometry(fine, samples, geom, fitPose, vignette.k)
                         if (st.gain > 0f) gain += (st.gain.coerceIn(0.5f, 2f) - gain) * 0.5f
                         vignette.add(st)
                     }
@@ -466,6 +460,13 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 }
             }
             if (recording && nowMs < blurryUntil && curHint != Hint.TOO_FAST) curHint = Hint.BLURRY
+
+            // Korekta dryfu żyroskopu: powoli i w granicach (zob. PoseCorrector).
+            imagePose?.let { ip ->
+                val dt = if (lastCorrNs == 0L) 0f else (tc - lastCorrNs) / 1e9f
+                corrector.update(ip * gyroPose.transposed(), dt)
+                lastCorrNs = tc
+            }
         }
 
         // Przekazanie do GPU: zszywana klatka zawsze, podglądowa tylko gdy renderer nadąża.
