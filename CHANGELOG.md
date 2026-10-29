@@ -1,5 +1,10 @@
 # Zmiany
 
+## 2.2.2
+
+- Dopasowane kolorystycznie tła ikon aplikacji i spójne zasoby graficzne.
+- Nowa ikona aplikacji, warianty systemowe i odświeżona grafika na stronie projektu.
+
 ## 2.2.0
 
 - Naprawione „domykanie się” koła za wcześnie przy obracaniu się w miejscu z telefonem w ręce: dopasowanie obrazem sumowało paralaksę bliskich przedmiotów (aparat porusza się po okręgu), więc panorama „myślała”, że obrót jest o kilkanaście procent większy, i nakładała obraz z początku zbyt wcześnie. Teraz położenie klatek wyznacza żyroskop, a obraz poprawia tylko jego powolny dryf i drobne lokalne przesunięcia.

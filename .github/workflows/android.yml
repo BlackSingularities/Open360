@@ -1,11 +1,9 @@
 name: Build & Release (Android)
 
-# Budowanie i wydanie po wypchnięciu tagu wersji (np. v1.2.3) albo na main – wtedy
-# wersja pochodzi z pliku VERSION, a tag v<wersja> zakłada samo wydanie (raz na wersję).
+# Wydanie po wypchnięciu tagu vX.Y.Z.
 on:
   push:
     tags: ['v*']
-    branches: ['main']
 
 permissions:
   contents: write
