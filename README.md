@@ -1,5 +1,7 @@
 # Open360
 
+<img src="artwork/app-icon.png" alt="Open360" width="128" />
+
 Panoramy 360° na żywo z aparatu telefonu (Android 10+). Wodzisz telefonem, a sfera wypełnia się na ekranie w czasie rzeczywistym — nie trzeba robić całej sfery, zapisujesz w dowolnej chwili.
 
 ## Możliwości

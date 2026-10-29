@@ -2,5 +2,5 @@
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/ic_launcher_background" />
     <item android:width="160dp" android:height="160dp" android:gravity="center"
-        android:drawable="@drawable/brand_monochrome" />
+        android:drawable="@drawable/brand_launcher" />
 </layer-list>
