@@ -41,6 +41,16 @@ fun Credits(modifier: Modifier = Modifier) {
                 .clickable { runCatching { uri.openUri(AUTHOR_URL) } }
                 .padding(horizontal = 8.dp, vertical = 6.dp),
         )
+        Text(
+            "kontakt@redzikowski.com",
+            color = Palette.TextDim,
+            fontSize = 13.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { runCatching { uri.openUri("mailto:kontakt@redzikowski.com") } }
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        )
         Spacer(Modifier.height(10.dp))
         Row(
             Modifier
