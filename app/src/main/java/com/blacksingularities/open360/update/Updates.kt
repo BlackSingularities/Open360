@@ -21,10 +21,10 @@ object Updates {
     /** Sprawdza ostatnie wydanie; null, gdy brak nowszego albo brak sieci. */
     suspend fun check(): Update? = withContext(Dispatchers.IO) {
         runCatching {
-            val c = URL("https://redzikowski.com/api/github/repos/${BuildConfig.UPDATE_REPO}/releases/latest").openConnection() as HttpURLConnection
+            val c = URL("https://redzikowski.com/api/releases/repos/${BuildConfig.UPDATE_REPO}/releases/latest").openConnection() as HttpURLConnection
             c.connectTimeout = 6000
             c.readTimeout = 6000
-            c.setRequestProperty("Accept", "application/vnd.github+json")
+            c.setRequestProperty("Accept", "application/json")
             val body = c.inputStream.bufferedReader().use { it.readText() }
             val j = JSONObject(body)
             val tag = j.getString("tag_name").removePrefix("v")
