@@ -1,5 +1,9 @@
 # Zmiany
 
+## 2.2.3
+
+- Komunikat o nowej wersji bez listy zmian, linków i informacji, skąd pobierana jest aktualizacja.
+
 ## 2.2.2
 
 - Dopasowane kolorystycznie tła ikon aplikacji i spójne zasoby graficzne.

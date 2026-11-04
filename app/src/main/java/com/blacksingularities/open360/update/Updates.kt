@@ -35,7 +35,7 @@ object Updates {
                 val a = assets.getJSONObject(i)
                 if (a.getString("name").endsWith(".apk")) apk = a.getString("browser_download_url")
             }
-            apk?.let { Update(tag, it, j.optString("body")) }
+            apk?.let { Update(tag, it, "") }
         }.getOrNull()
     }
 
