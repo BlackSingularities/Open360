@@ -51,6 +51,18 @@ fun Credits(modifier: Modifier = Modifier) {
                 .clickable { runCatching { uri.openUri("mailto:kontakt@redzikowski.com") } }
                 .padding(horizontal = 8.dp, vertical = 6.dp),
         )
+        com.blacksingularities.open360.feedback.FeedbackEntry { open ->
+            Text(
+                com.blacksingularities.open360.feedback.FeedbackText.entryTitle,
+                color = Palette.TextDim,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { open() }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+            )
+        }
         Spacer(Modifier.height(10.dp))
         Row(
             Modifier

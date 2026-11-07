@@ -1,5 +1,7 @@
 package com.blacksingularities.open360
 
+import com.blacksingularities.open360.feedback.Feedback
+import com.blacksingularities.open360.feedback.CrashReportPrompt
 import android.Manifest
 import android.app.Activity
 import android.content.ClipData
@@ -47,12 +49,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(SystemBarStyle.dark(android.graphics.Color.TRANSPARENT), SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
+        Feedback.install(this, "open360")
         window.setBackgroundDrawableResource(android.R.color.black)
         val settings = Settings(this)
         handleIntent(intent)
 
         setContent {
             Open360Theme {
+                CrashReportPrompt()
                 val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
                     if (granted) {
                         screen = Screen.Capture

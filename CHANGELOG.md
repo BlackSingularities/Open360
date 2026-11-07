@@ -1,5 +1,10 @@
 # Zmiany
 
+## 2.4.0
+
+- Zgłaszanie błędów i sugestii: nowa pozycja „Zgłoś błąd lub sugestię” – opis trafia prosto do autora przez redzikowski.com, e-mail jest opcjonalny.
+- Po nieoczekiwanym zamknięciu aplikacja przy następnym uruchomieniu proponuje wysłanie raportu o błędzie – tylko za zgodą użytkownika.
+
 ## 2.3.0
 
 - Globalne dopasowanie przy zapisie: wszystkie zachowane klatki są dopasowywane naraz. W parach nachodzących się klatek śledzone są punkty o silnej teksturze (piramidalny Lucas-Kanade z testem w obie strony i RANSAC), a bundle adjustment wyznacza obroty wszystkich klatek, kąt widzenia i dystorsję obiektywu. Klatki nie rozjeżdżają się już o kilka stopni, bo o ich położeniu nie decyduje głównie żyroskop.
