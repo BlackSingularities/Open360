@@ -34,11 +34,19 @@ vec2 camUv(vec2 uv, int rot) {
     if (rot == 270) return vec2(1.0 - uv.y, uv.x);
     return uv;
 }
+// Dystorsja radialna obiektywu (jak FrameGeom.distort): tangensy promienia → tangensy obrazu.
+vec2 lensDistort(vec2 tu, vec2 camTan, float k1) {
+    if (k1 == 0.0) return tu;
+    float inv = 1.0 / dot(camTan, camTan);
+    vec2 td = tu;
+    for (int i = 0; i < 4; i++) td = tu / (1.0 + k1 * dot(td, td) * inv);
+    return td;
+}
 // Kierunek panoramy → współrzędne kadru kamery (−1..1, y w górę); z > 0 – za kamerą.
-vec3 camProject(mat3 panoToCam, vec2 camTan, vec3 d) {
+vec3 camProject(mat3 panoToCam, vec2 camTan, float k1, vec3 d) {
     vec3 c = panoToCam * d;
     if (c.z >= -1e-4) return vec3(0.0, 0.0, 1.0);
-    vec2 p = (c.xy / -c.z) / camTan;
+    vec2 p = lensDistort(c.xy / -c.z, camTan, k1) / camTan;
     return vec3(p, -1.0);
 }
 // Kamera daje YUV (BT.601, pełny zakres) – zamiana na RGB na GPU zamiast na CPU.
@@ -74,6 +82,7 @@ uniform float uVignette;
 uniform vec3 uOmega;
 uniform float uSkew;
 uniform float uQuality;
+uniform float uK1;
 $COMMON
 const float BAND = 0.1;
 const float GHOST = 0.08;
@@ -81,11 +90,11 @@ void main() {
     vec2 gpx = gl_FragCoord.xy + uOrigin;
     vec4 old = texelFetch(uTile, ivec2(gpx - uTileOrigin), 0);
     vec3 c = uPanoToCam * dirFromUv(gpx / uCanvasSize);
-    vec2 p = (c.xy / -min(c.z, -1e-4)) / uCamTan;
+    vec2 p = lensDistort(c.xy / -min(c.z, -1e-4), uCamTan, uK1) / uCamTan;
     vec2 b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
     // Wiersz odczytywany τ s od środka klatki widział świat obrócony o ω·τ.
     vec3 c2 = c - ((b.y - 0.5) * uSkew) * cross(uOmega, c);
-    p = (c2.xy / -min(c2.z, -1e-4)) / uCamTan;
+    p = lensDistort(c2.xy / -min(c2.z, -1e-4), uCamTan, uK1) / uCamTan;
     b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
     vec2 bx = dFdx(b);
     vec2 by = dFdy(b);
@@ -103,6 +112,81 @@ void main() {
         if (diff > GHOST) t = smoothstep(0.35, 0.65, t);
     }
     outColor = vec4(mix(old.rgb, rgb, t), mix(old.a, wN, t));
+}
+"""
+
+    /**
+     * Przed ponownym złożeniem: czyści piksele płótna, które obejmie plan (maska na siatce
+     * etykiet, najbliższy sąsiad). Reszta – skrawki bez zachowanej klatki – zostaje z podglądu.
+     */
+    val CLEARMASK = """#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTile;
+uniform sampler2D uMask;
+uniform vec2 uOrigin;
+uniform vec2 uTileOrigin;
+uniform vec2 uCanvasSize;
+void main() {
+    vec2 gpx = gl_FragCoord.xy + uOrigin;
+    vec4 old = texelFetch(uTile, ivec2(gpx - uTileOrigin), 0);
+    ivec2 ms = textureSize(uMask, 0);
+    ivec2 m = clamp(ivec2(gpx / uCanvasSize * vec2(ms)), ivec2(0), ms - 1);
+    outColor = texelFetch(uMask, m, 0).r > 0.5 ? vec4(0.0) : old;
+}
+"""
+
+    /**
+     * Ponowne złożenie: klatka z pliku (RGB, orientacja bufora) w pozie po globalnym dopasowaniu,
+     * z wagą z wyszukiwania szwów (tekstura na siatce etykiet w zakresie [uBox]). Płótno liczy
+     * średnią ważoną: alfa przechowuje sumę wag dotychczasowych klatek, więc wynik to
+     * Σ w·kolor / Σ w niezależnie od kolejności.
+     */
+    val REPAINT = """#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTile;
+uniform sampler2D uCam;
+uniform sampler2D uWeight;
+uniform mat3 uPanoToCam;
+uniform vec2 uCamTan;
+uniform float uK1;
+uniform int uCamRot;
+uniform vec2 uOrigin;
+uniform vec2 uTileOrigin;
+uniform vec2 uCanvasSize;
+uniform float uGain;
+uniform float uVignette;
+uniform vec3 uOmega;
+uniform float uSkew;
+uniform vec4 uBox;
+uniform vec2 uLabelSize;
+$COMMON
+void main() {
+    vec2 gpx = gl_FragCoord.xy + uOrigin;
+    vec4 old = texelFetch(uTile, ivec2(gpx - uTileOrigin), 0);
+    vec2 uv = gpx / uCanvasSize;
+    float lx = mod(uv.x * uLabelSize.x - uBox.x, uLabelSize.x);
+    float ly = uv.y * uLabelSize.y - uBox.z;
+    if (lx >= uBox.y || ly < 0.0 || ly >= uBox.w) { outColor = old; return; }
+    float w = texture(uWeight, vec2(lx / uBox.y, ly / uBox.w)).r;
+    if (w <= 0.0) { outColor = old; return; }
+    vec3 c = uPanoToCam * dirFromUv(uv);
+    vec2 p = lensDistort(c.xy / -min(c.z, -1e-4), uCamTan, uK1) / uCamTan;
+    vec2 b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
+    vec3 c2 = c - ((b.y - 0.5) * uSkew) * cross(uOmega, c);
+    p = lensDistort(c2.xy / -min(c2.z, -1e-4), uCamTan, uK1) / uCamTan;
+    b = camUv(vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5), uCamRot);
+    vec2 bx = dFdx(b);
+    vec2 by = dFdy(b);
+    if (c.z > -1e-4 || c2.z > -1e-4 || abs(p.x) >= 1.0 || abs(p.y) >= 1.0) { outColor = old; return; }
+    vec3 rgb = textureGrad(uCam, b, bx, by).rgb;
+    vec2 tn = p * uCamTan;
+    float r2 = dot(tn, tn) / dot(uCamTan, uCamTan);
+    vec3 lin = pow(rgb, vec3(2.2)) * (uGain * (1.0 + uVignette * r2));
+    rgb = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
+    float a = old.a + w;
+    outColor = vec4((old.rgb * old.a + rgb * w) / a, min(a, 1.0));
 }
 """
 
@@ -150,6 +234,7 @@ uniform sampler2D uU;
 uniform sampler2D uV;
 uniform mat3 uPanoToCam;
 uniform vec2 uCamTan;
+uniform float uCamK1;
 uniform int uCamRot;
 uniform float uLiveAlpha;
 uniform vec4 uFrameColor;
@@ -193,7 +278,7 @@ void main() {
         vec4 s = textureLod(uPano, cuv, uLod);
         col = mix(col, s.rgb, smoothstep(0.0, 2.0 / 255.0, s.a));
     }
-    vec3 p = camProject(uPanoToCam, uCamTan, d);
+    vec3 p = camProject(uPanoToCam, uCamTan, uCamK1, d);
     float m = (uHasCam && p.z < 0.0) ? max(abs(p.x), abs(p.y)) : 10.0;
     float fw = min(fwidth(m), 0.05) * 2.2;
     if (m < 1.0) {

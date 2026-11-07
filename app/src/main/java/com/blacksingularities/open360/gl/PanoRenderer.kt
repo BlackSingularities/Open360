@@ -89,6 +89,8 @@ class PanoRenderer(
     private var viewProg = 0
     private var premulProg = 0
     private var exportProg = 0
+    private var clearProg = 0
+    private var repaintProg = 0
     private var quad = 0
     private val uniforms = HashMap<Int, HashMap<String, Int>>()
 
@@ -124,6 +126,7 @@ class PanoRenderer(
     private val camPanoToCam = FloatArray(9)
     private var camTanX = 0.5f
     private var camTanY = 0.7f
+    private var camK1 = 0f
     private var camRot = 0
     private val tmp9 = FloatArray(9)
     private val viewerQueue = ConcurrentLinkedQueue<ExportRequest>()
@@ -131,6 +134,11 @@ class PanoRenderer(
     private var export: CanvasExport? = null
     private var stripTex = 0
     private var stripFbo = 0
+
+    // Ponowne złożenie płótna po globalnym dopasowaniu.
+    private var repaint: RepaintJob? = null
+    private var repaintCamTex = 0
+    private var repaintWeightTex = 0
 
     /** Wywoływane, gdy kontekst GL powstał od nowa (treść płótna przepadła). */
     var onContextLost: (() -> Unit)? = null
@@ -157,6 +165,8 @@ class PanoRenderer(
         viewProg = GlUtil.program(Shaders.VERTEX, Shaders.VIEW)
         premulProg = GlUtil.program(Shaders.VERTEX, Shaders.PREMUL)
         exportProg = GlUtil.program(Shaders.VERTEX, Shaders.EXPORT)
+        clearProg = GlUtil.program(Shaders.VERTEX, Shaders.CLEARMASK)
+        repaintProg = GlUtil.program(Shaders.VERTEX, Shaders.REPAINT)
         quad = GlUtil.quad()
         val ext = glGetString(GL_EXTENSIONS) ?: ""
         anisotropy = if (ext.contains("GL_EXT_texture_filter_anisotropic")) {
@@ -174,6 +184,9 @@ class PanoRenderer(
         tiles = emptyList()
         export = null
         stripTex = 0; stripFbo = 0
+        repaint?.finish(false)
+        repaint = null
+        repaintCamTex = 0; repaintWeightTex = 0
         if (engine != null) allocCanvas()
         photoTex = 0
         if (created) main.post { onContextLost?.invoke() }
@@ -298,6 +311,7 @@ class PanoRenderer(
                 runCommand(cmd)
             }
             consumeFrame(e)
+            repaint?.let { stepRepaint(it) }
             export?.let { stepExport(it) }
         }
         pendingPhoto.poll()?.let { uploadPhoto(it) }
@@ -344,6 +358,10 @@ class PanoRenderer(
                 export?.let { finishExport(it, failed = true) }
                 export = cmd.export
             }
+            is GlCommand.Repaint -> {
+                repaint?.finish(false)
+                repaint = cmd.job
+            }
         }
     }
 
@@ -365,6 +383,7 @@ class PanoRenderer(
             f.panoToCam.copyInto(camPanoToCam)
             camTanX = f.tanX
             camTanY = f.tanY
+            camK1 = f.k1
             camRot = f.rotation
             hasCam = true
             if (f.stitch && tiles.isNotEmpty()) stitch(f)
@@ -406,32 +425,32 @@ class PanoRenderer(
         }
     }
 
-    private fun stitch(f: StitchFrame) {
-        val b = f.box
-        val y0 = b.y0.coerceIn(0, ch - 1)
-        val hh = (b.y1 - b.y0 + 1).coerceIn(1, ch - y0)
+    /** Prostokąty płótna (x, y, w, h) zakresu – zakres może zawijać się przez szew 180°. */
+    private fun rectsOf(x0: Int, width: Int, y0In: Int, y1In: Int): List<IntArray> {
+        val y0 = y0In.coerceIn(0, ch - 1)
+        val hh = (y1In - y0 + 1).coerceIn(1, ch - y0)
         val rects = ArrayList<IntArray>(2)
-        if (b.x0 + b.width <= cw) {
-            rects += intArrayOf(b.x0, y0, b.width, hh)
+        if (width >= cw) {
+            rects += intArrayOf(0, y0, cw, hh)
         } else {
-            rects += intArrayOf(b.x0, y0, cw - b.x0, hh)
-            rects += intArrayOf(0, y0, b.x0 + b.width - cw, hh)
+            val x = ((x0 % cw) + cw) % cw
+            if (x + width <= cw) {
+                rects += intArrayOf(x, y0, width, hh)
+            } else {
+                rects += intArrayOf(x, y0, cw - x, hh)
+                rects += intArrayOf(0, y0, x + width - cw, hh)
+            }
         }
-        setCamMipmaps(true)
-        val p = stitchProg
-        glUseProgram(p)
-        GlUtil.bindTex(p, "uY", 1, camY.tex)
-        GlUtil.bindTex(p, "uU", 2, camU.tex)
-        GlUtil.bindTex(p, "uV", 3, camV.tex)
-        glUniformMatrix3fv(u(p, "uPanoToCam"), 1, false, camPanoToCam, 0)
-        glUniform2f(u(p, "uCamTan"), camTanX, camTanY)
-        glUniform1i(u(p, "uCamRot"), camRot)
+        return rects
+    }
+
+    /**
+     * Rysuje program [p] na płótnie w prostokątach [rects]: kafelek po kafelku przez bufor
+     * roboczy (shader czyta stary piksel z uTile, wynik wraca do kafelka). Pozostałe uniformy
+     * i tekstury (jednostki ≥ 1) ustawia wywołujący.
+     */
+    private fun drawOverCanvas(rects: List<IntArray>, p: Int) {
         glUniform2f(u(p, "uCanvasSize"), cw.toFloat(), ch.toFloat())
-        glUniform1f(u(p, "uGain"), f.gain)
-        glUniform1f(u(p, "uVignette"), f.vignette)
-        glUniform3f(u(p, "uOmega"), f.omega[0], f.omega[1], f.omega[2])
-        glUniform1f(u(p, "uSkew"), f.skew)
-        glUniform1f(u(p, "uQuality"), f.quality)
         glDisable(GL_SCISSOR_TEST)
         for (r in rects) {
             for (t in tiles) {
@@ -458,8 +477,139 @@ class PanoRenderer(
                 }
             }
         }
-        setCamMipmaps(false)
         for (r in rects) updatePreview(r[0], r[1], r[2], r[3])
+    }
+
+    private fun stitch(f: StitchFrame) {
+        val b = f.box
+        val rects = rectsOf(b.x0, b.width, b.y0, b.y1)
+        setCamMipmaps(true)
+        val p = stitchProg
+        glUseProgram(p)
+        GlUtil.bindTex(p, "uY", 1, camY.tex)
+        GlUtil.bindTex(p, "uU", 2, camU.tex)
+        GlUtil.bindTex(p, "uV", 3, camV.tex)
+        glUniformMatrix3fv(u(p, "uPanoToCam"), 1, false, camPanoToCam, 0)
+        glUniform2f(u(p, "uCamTan"), camTanX, camTanY)
+        glUniform1i(u(p, "uCamRot"), camRot)
+        glUniform2f(u(p, "uCanvasSize"), cw.toFloat(), ch.toFloat())
+        glUniform1f(u(p, "uGain"), f.gain)
+        glUniform1f(u(p, "uVignette"), f.vignette)
+        glUniform3f(u(p, "uOmega"), f.omega[0], f.omega[1], f.omega[2])
+        glUniform1f(u(p, "uSkew"), f.skew)
+        glUniform1f(u(p, "uQuality"), f.quality)
+        glUniform1f(u(p, "uK1"), f.k1)
+        drawOverCanvas(rects, p)
+        setCamMipmaps(false)
+    }
+
+    // ── Ponowne złożenie po globalnym dopasowaniu ───────────────────────────
+
+    /** Jeden krok: na początku czyszczenie obszaru planu, potem jedna klatka na wywołanie. */
+    private fun stepRepaint(job: RepaintJob) {
+        if (job.cancelled) {
+            endRepaint(job, ok = false)
+            return
+        }
+        try {
+            if (!job.started) {
+                job.started = true
+                val plan = job.plan
+                val mask = ByteBuffer.allocateDirect(plan.lw * plan.lh)
+                for (c in plan.covered) mask.put(if (c) 255.toByte() else 0)
+                mask.position(0)
+                val mt = r8Texture(plan.lw, plan.lh, mask, GL_NEAREST)
+                val p = clearProg
+                glUseProgram(p)
+                GlUtil.bindTex(p, "uMask", 1, mt)
+                drawOverCanvas(listOf(intArrayOf(0, 0, cw, ch)), p)
+                GlUtil.deleteTextures(mt)
+                return
+            }
+            val d = job.decoded.poll() ?: return
+            d.bitmap?.let { bmp ->
+                drawPlanFrame(job, d.index, bmp)
+                bmp.recycle()
+            }
+            job.drawn++
+            if (job.drawn >= job.total) endRepaint(job, ok = true)
+        } catch (t: Throwable) {
+            Log.e("Open360", "repaint", t)
+            endRepaint(job, ok = false)
+        }
+    }
+
+    private fun endRepaint(job: RepaintJob, ok: Boolean) {
+        GlUtil.deleteTextures(repaintCamTex, repaintWeightTex)
+        repaintCamTex = 0; repaintWeightTex = 0
+        while (true) job.decoded.poll()?.bitmap?.recycle() ?: break
+        if (repaint === job) repaint = null
+        job.finish(ok)
+    }
+
+    private fun r8Texture(w: Int, h: Int, data: ByteBuffer, filter: Int): Int {
+        val t = IntArray(1)
+        glGenTextures(1, t, 0)
+        glBindTexture(GL_TEXTURE_2D, t[0])
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED, GL_UNSIGNED_BYTE, data)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4)
+        return t[0]
+    }
+
+    private fun drawPlanFrame(job: RepaintJob, index: Int, bmp: Bitmap) {
+        val plan = job.plan
+        val f = plan.frames[index]
+        // Kolor klatki z mipmapami (antyaliasing przy pomniejszaniu).
+        if (repaintCamTex == 0) {
+            val t = IntArray(1)
+            glGenTextures(1, t, 0)
+            repaintCamTex = t[0]
+        }
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, repaintCamTex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        if (anisotropy > 1f) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy)
+        GLUtils.texImage2D(GL_TEXTURE_2D, 0, bmp, 0)
+        glGenerateMipmap(GL_TEXTURE_2D)
+        // Waga z wyszukiwania szwów.
+        val bw = f.box.width
+        val bh = f.box.y1 - f.box.y0 + 1
+        val wb = ByteBuffer.allocateDirect(bw * bh)
+        wb.put(f.weight)
+        wb.position(0)
+        GlUtil.deleteTextures(repaintWeightTex)
+        repaintWeightTex = r8Texture(bw, bh, wb, GL_LINEAR)
+
+        val p = repaintProg
+        glUseProgram(p)
+        GlUtil.bindTex(p, "uCam", 1, repaintCamTex)
+        GlUtil.bindTex(p, "uWeight", 2, repaintWeightTex)
+        f.pose.transposed().toGl(tmp9)
+        glUniformMatrix3fv(u(p, "uPanoToCam"), 1, false, tmp9, 0)
+        glUniform2f(u(p, "uCamTan"), f.geom.tanX, f.geom.tanY)
+        glUniform1f(u(p, "uK1"), f.geom.k1)
+        glUniform1i(u(p, "uCamRot"), f.kf.rot)
+        glUniform1f(u(p, "uGain"), f.gain)
+        glUniform1f(u(p, "uVignette"), plan.vignette)
+        glUniform3f(u(p, "uOmega"), f.kf.omega.x, f.kf.omega.y, f.kf.omega.z)
+        glUniform1f(u(p, "uSkew"), f.kf.skew)
+        glUniform4f(u(p, "uBox"), f.box.x0.toFloat(), bw.toFloat(), f.box.y0.toFloat(), bh.toFloat())
+        glUniform2f(u(p, "uLabelSize"), plan.lw.toFloat(), plan.lh.toFloat())
+        // Zakres na płótnie z zapasem jednej komórki siatki (waga jest interpolowana).
+        val sc = cw.toFloat() / plan.lw
+        val x0 = kotlin.math.floor((f.box.x0 - 1) * sc).toInt()
+        val width = if (bw + 2 >= plan.lw) cw else kotlin.math.ceil((bw + 2) * sc).toInt()
+        val y0 = kotlin.math.floor((f.box.y0 - 1) * sc).toInt()
+        val y1 = kotlin.math.ceil((f.box.y1 + 2) * sc).toInt()
+        drawOverCanvas(rectsOf(x0, width, y0, y1), p)
     }
 
     /** Odświeża pomniejszony podgląd w prostokącie płótna (x, y, w, h). */
@@ -524,6 +674,7 @@ class PanoRenderer(
         glUniform1i(u(p, "uHasCam"), if (live) 1 else 0)
         glUniformMatrix3fv(u(p, "uPanoToCam"), 1, false, camPanoToCam, 0)
         glUniform2f(u(p, "uCamTan"), camTanX, camTanY)
+        glUniform1f(u(p, "uCamK1"), camK1)
         glUniform1i(u(p, "uCamRot"), camRot)
         glUniform1f(u(p, "uLiveAlpha"), view.liveAlpha)
         if (view.recording) {

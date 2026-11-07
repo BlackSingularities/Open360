@@ -182,8 +182,8 @@ class StitchTest {
             worst = maxOf(worst, (stitched * gyro.transposed()).log().length() / DEG)
         }
         println("max odchylenie od żyroskopu po 360°: $worst°")
-        // Bez ograniczenia byłoby ~47°.
-        assertTrue(worst < 2.5f)
+        // Bez ograniczenia byłoby ~47°; z ograniczeniem – najwyżej lokalne dosunięcie plus wolny dryf.
+        assertTrue(worst < PoseCorrector.LOCAL / DEG + 2f)
         // Prawdziwy dryf żyroskopu (stałe 2°) korekta jednak przyjmuje.
         val drift = Mat3.rotZ(2f * DEG)
         repeat(400) { pc.update(drift, 0.05f) }

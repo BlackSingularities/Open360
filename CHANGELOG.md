@@ -1,5 +1,16 @@
 # Zmiany
 
+## 2.3.0
+
+- Globalne dopasowanie przy zapisie: wszystkie zachowane klatki są dopasowywane naraz. W parach nachodzących się klatek śledzone są punkty o silnej teksturze (piramidalny Lucas-Kanade z testem w obie strony i RANSAC), a bundle adjustment wyznacza obroty wszystkich klatek, kąt widzenia i dystorsję obiektywu. Klatki nie rozjeżdżają się już o kilka stopni, bo o ich położeniu nie decyduje głównie żyroskop.
+- Szwy omijają ruchome obiekty i miejsca, w których klatki się nie zgadzają (graph-cut na siatce 0,5°), zamiast przecinać autobusy i słupy w połowie drogi między środkami kadrów.
+- Wyrównanie jasności między wszystkimi klatkami naraz (także między osobnymi seriami zdjęć z inną ekspozycją).
+- Model dystorsji obiektywu (beczka/poduszka) w geometrii klatki i w shaderach.
+- Samokalibracja kąta widzenia i dystorsji podczas robienia zdjęć, zapamiętywana dla każdego obiektywu. Skala jest mocno przyciągana do danych aparatu, a z panoram z dużą paralaksą kalibracja nie jest zapisywana.
+- Na żywo obraz może dosunąć klatkę o 1,6° (wcześniej 0,35°) – podgląd lepiej trzyma szwy przy błędach czujnika.
+- Naprawiony kąt widzenia obiektywu szerokokątnego (powiększenie < 1×): ogniskowa innego obiektywu nie jest już łączona z rozmiarem matrycy głównego.
+- Ostrzeżenie po zapisie, gdy bliskie przedmioty przesuwały się względem tła (obracanie się z telefonem zamiast wokół obiektywu).
+
 ## 2.2.5
 
 - Minimalistyczny ekran główny: tytuł, przyciski „Nowa panorama” i „Otwórz zdjęcie 360°” oraz lista panoram – bez dużego panelu z opisem.

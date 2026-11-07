@@ -36,6 +36,8 @@ class Settings(context: Context) {
     // Aparat
     var exposure by pref("exposure", 0)
     var wide by pref("wide", false)
+    /** Samokalibracja obiektywu: „klucz aparatu;skala kąta widzenia;k1;liczba pomiarów”. */
+    var lensCal by pref("lensCal", "")
 
     // Podgląd (gestem na ekranie i przyciskiem siatki)
     var viewZoomOut by pref("viewZoomOut", 1.6f)

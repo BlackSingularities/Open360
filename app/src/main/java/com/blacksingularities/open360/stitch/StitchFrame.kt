@@ -45,6 +45,8 @@ class StitchFrame {
     val panoToCam = FloatArray(9)
     var tanX = 0.5f
     var tanY = 0.7f
+    /** Dystorsja radialna obiektywu (FrameGeom.k1). */
+    var k1 = 0f
     var gain = 1f
     var vignette = 0f
     /** Prędkość kątowa w układzie kamery (rad/s) i czas odczytu matrycy (s). */

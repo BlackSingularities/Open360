@@ -31,6 +31,10 @@ object Gamma {
  * szczelinowa (rolling shutter). Wiersze matrycy są czytane po kolei przez [skew] sekund,
  * więc przy obrocie telefonu każdy wiersz ma trochę inną pozę – [omega] (rad/s, układ
  * urządzenia) pozwala to odwrócić. Poza klatki dotyczy środka odczytu (τ = 0).
+ *
+ * Dystorsja radialna obiektywu [k1]: punkt obrazu o tangensach (x, y) leży na promieniu
+ * (x, y)·(1 + k1·r²), r² = (x² + y²)/(tanX² + tanY²) – 0 w środku, 1 w rogu kadru.
+ * Tę samą formułę liczą shadery (Shaders.COMMON).
  */
 class FrameGeom(
     val tanX: Float,
@@ -39,8 +43,27 @@ class FrameGeom(
     val rot: Int = 0,
     val skew: Float = 0f,
     val omega: Vec3 = Vec3(0f, 0f, 0f),
+    val k1: Float = 0f,
 ) {
     private val shutter = skew > 0f && omega.length() > 1e-4f
+    private val invDiag2 = 1f / (tanX * tanX + tanY * tanY)
+
+    /** Mnożnik (1 + k1·r²) dla punktu obrazu o tangensach (x, y). */
+    fun undistortFactor(x: Float, y: Float): Float = 1f + k1 * (x * x + y * y) * invDiag2
+
+    /** Tangensy obrazu (z dystorsją) dla promienia o tangensach [xu], [yu]; wynik w [out]. */
+    fun distort(xu: Float, yu: Float, out: FloatArray) {
+        if (k1 == 0f) {
+            out[0] = xu; out[1] = yu
+            return
+        }
+        var xd = xu; var yd = yu
+        repeat(4) {
+            val f = 1f + k1 * (xd * xd + yd * yd) * invDiag2
+            xd = xu / f; yd = yu / f
+        }
+        out[0] = xd; out[1] = yd
+    }
 
     /** Współrzędna wiersza bufora (0..1) dla punktu (u, v) obrazu pionowego (v w dół). */
     fun bufferRow(u: Float, v: Float): Float = when (rot) {
@@ -58,8 +81,10 @@ class FrameGeom(
      * tangensowych (x, y) (x w prawo, y w górę): p + τ·(ω × p).
      */
     fun rayAt(x: Float, y: Float): Vec3 {
-        val n = 1f / sqrt(x * x + y * y + 1f)
-        val px = x * n; val py = y * n; val pz = -n
+        val k = if (k1 == 0f) 1f else undistortFactor(x, y)
+        val xu = x * k; val yu = y * k
+        val n = 1f / sqrt(xu * xu + yu * yu + 1f)
+        val px = xu * n; val py = yu * n; val pz = -n
         if (!shutter) return Vec3(px, py, pz)
         val u = 0.5f + 0.5f * x / tanX
         val v = 0.5f - 0.5f * y / tanY
@@ -78,8 +103,9 @@ class FrameGeom(
      */
     fun project(cx: Float, cy: Float, cz: Float, out: FloatArray): Boolean {
         if (cz >= -1e-4f) return false
-        var u = 0.5f + 0.5f * (cx / -cz) / tanX
-        var v = 0.5f - 0.5f * (cy / -cz) / tanY
+        distort(cx / -cz, cy / -cz, out)
+        var u = 0.5f + 0.5f * out[0] / tanX
+        var v = 0.5f - 0.5f * out[1] / tanY
         if (shutter) {
             val t = rowTime(u, v)
             val o = omega
@@ -87,15 +113,17 @@ class FrameGeom(
             val y = cy - t * (o.z * cx - o.x * cz)
             val z = cz - t * (o.x * cy - o.y * cx)
             if (z >= -1e-4f) return false
-            u = 0.5f + 0.5f * (x / -z) / tanX
-            v = 0.5f - 0.5f * (y / -z) / tanY
+            distort(x / -z, y / -z, out)
+            u = 0.5f + 0.5f * out[0] / tanX
+            v = 0.5f - 0.5f * out[1] / tanY
         }
         out[0] = u
         out[1] = v
         return true
     }
 
-    fun withTan(tx: Float, ty: Float) = FrameGeom(tx, ty, rot, skew, omega)
+    fun withTan(tx: Float, ty: Float) = FrameGeom(tx, ty, rot, skew, omega, k1)
+    fun withLens(tx: Float, ty: Float, k: Float) = FrameGeom(tx, ty, rot, skew, omega, k)
 }
 
 /** Korekta jasności klatki: wzmocnienie ekspozycji i winietowanie (oba liniowo). */

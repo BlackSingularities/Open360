@@ -94,6 +94,8 @@ class AlignResult(
     val fovScale: Float = 1f,
     /** Czy obrót był dobrze wyznaczony we wszystkich osiach (tekstura w różnych kierunkach). */
     val conditioned: Boolean = true,
+    /** Poprawka dystorsji k1 z tej klatki (przyrost). */
+    val k1Delta: Float = 0f,
 ) {
     enum class Status { OK, WEAK, MISMATCH, NO_OVERLAP }
 }
@@ -240,23 +242,28 @@ object Aligner {
         val inv = 1f / canvas.radPerPx
         var rot = init
         var scale = 1f
+        var k1 = geom.k1
         var a = 1.0; var b = 0.0
         var sigma = 0.08f
         val res = FloatArray(n)
-        val H = DoubleArray(36)
-        val g = DoubleArray(6)
-        val J = DoubleArray(6)
+        val P = 7
+        val H = DoubleArray(P * P)
+        val g = DoubleArray(P)
+        val J = DoubleArray(P)
         var valid = 0
         var hww = DoubleArray(9)
+        val invDiag2 = 1f / (geom.tanX * geom.tanX + geom.tanY * geom.tanY)
+        var gIt = geom
         for (it in 0 until iterations) {
             H.fill(0.0); g.fill(0.0)
             valid = 0
             var cnt = 0
             val m = rot.m
+            if (k1 != gIt.k1) gIt = geom.withLens(geom.tanX, geom.tanY, k1)
             for (i in 0 until n) {
                 val tx = (2f * s.u[i] - 1f) * geom.tanX * scale
                 val ty = (1f - 2f * s.v[i]) * geom.tanY * scale
-                val p = geom.rayAt(tx, ty)
+                val p = gIt.rayAt(tx, ty)
                 val dx = m[0] * p.x + m[1] * p.y + m[2] * p.z
                 val dy = m[3] * p.x + m[4] * p.y + m[5] * p.z
                 val dz = m[6] * p.x + m[7] * p.y + m[8] * p.z
@@ -285,55 +292,77 @@ object Aligner {
                 J[1] = (dz * gx - dx * gz).toDouble()
                 J[2] = (dx * gy - dy * gx).toDouble()
                 if (estimateFov) {
-                    val nn = 1f / (tx * tx + ty * ty + 1f)
+                    // Pochodna promienia po skali tangensów (bez dystorsji) i po k1 – ta druga
+                    // to ta sama radialna zmiana, ważona r² (rośnie ku brzegom kadru).
+                    val rn2 = (tx * tx + ty * ty) * invDiag2
+                    val f = 1f + k1 * rn2
+                    val ux = tx * f; val uy = ty * f
+                    val nn = 1f / (ux * ux + uy * uy + 1f)
                     val q = nn * sqrt(nn)
-                    val px = tx * q; val py = ty * q; val pz = (tx * tx + ty * ty) * q
+                    val px = ux * q; val py = uy * q; val pz = (ux * ux + uy * uy) * q
                     val ex = m[0] * px + m[1] * py + m[2] * pz
                     val ey = m[3] * px + m[4] * py + m[5] * pz
                     val ez = m[6] * px + m[7] * py + m[8] * pz
-                    J[3] = (gx * ex + gy * ey + gz * ez).toDouble()
+                    val js = (gx * ex + gy * ey + gz * ez).toDouble()
+                    J[3] = js
+                    J[4] = js * rn2 / f
                 } else {
                     J[3] = 0.0
+                    J[4] = 0.0
                 }
-                J[4] = -s.f[i].toDouble()
-                J[5] = -1.0
+                J[5] = -s.f[i].toDouble()
+                J[6] = -1.0
                 val k = 1.5f * sigma
                 val wgt = if (abs(r) <= k) 1.0 else (k / abs(r)).toDouble()
-                for (p1 in 0 until 6) {
+                for (p1 in 0 until P) {
                     val jw = J[p1] * wgt
                     g[p1] += jw * r
-                    for (p2 in p1 until 6) H[p1 * 6 + p2] += jw * J[p2]
+                    for (p2 in p1 until P) H[p1 * P + p2] += jw * J[p2]
                 }
             }
             if (valid < 30 || valid < n * MIN_OVERLAP) {
                 return AlignResult(AlignResult.Status.NO_OVERLAP, init, 0f, valid.toFloat() / n, valid)
             }
-            for (p1 in 0 until 6) for (p2 in 0 until p1) H[p1 * 6 + p2] = H[p2 * 6 + p1]
-            hww = DoubleArray(9) { H[(it / 3) * 6 + it % 3] / valid }
-            // Regularyzacja: skala tylko przy wyraźnych danych, przesunięcia jasności lekko.
-            if (estimateFov) H[3 * 6 + 3] += 4.0 * H[3 * 6 + 3] + 1e-6 * valid else H[3 * 6 + 3] = 1.0
-            for (p1 in 0 until 3) H[p1 * 6 + p1] += 1e-9 * valid + 1e-4 * H[p1 * 6 + p1]
-            H[4 * 6 + 4] += 1e-3 * valid
-            H[5 * 6 + 5] += 1e-3 * valid
-            val delta = solve(H, g.map { -it }.toDoubleArray(), 6) ?: break
+            for (p1 in 0 until P) for (p2 in 0 until p1) H[p1 * P + p2] = H[p2 * P + p1]
+            hww = DoubleArray(9) { H[(it / 3) * P + it % 3] / valid }
+            // Regularyzacja: skala i dystorsja tylko przy wyraźnych danych (dystorsja mocniej),
+            // przesunięcia jasności lekko.
+            if (estimateFov) {
+                H[3 * P + 3] += 4.0 * H[3 * P + 3] + 1e-6 * valid
+                H[4 * P + 4] += 9.0 * H[4 * P + 4] + 1e-5 * valid
+            } else {
+                for (p1 in 3..4) {
+                    for (p2 in 0 until P) { H[p1 * P + p2] = 0.0; H[p2 * P + p1] = 0.0 }
+                    H[p1 * P + p1] = 1.0
+                    g[p1] = 0.0
+                }
+            }
+            for (p1 in 0 until 3) H[p1 * P + p1] += 1e-9 * valid + 1e-4 * H[p1 * P + p1]
+            H[5 * P + 5] += 1e-3 * valid
+            H[6 * P + 6] += 1e-3 * valid
+            val delta = solve(H, g.map { -it }.toDoubleArray(), P) ?: break
             val w = Vec3(delta[0].toFloat(), delta[1].toFloat(), delta[2].toFloat())
             // Krok ograniczony do 1° – Gauss-Newton daleko od minimum bywa zbyt śmiały.
             val wl = w.length()
             val wStep = if (wl > DEG) w * (DEG / wl) else w
             rot = (Mat3.exp(wStep) * rot).orthonormalized()
-            if (estimateFov) scale = (scale * (1f + delta[3].toFloat().coerceIn(-0.01f, 0.01f))).coerceIn(0.9f, 1.1f)
-            a += delta[4]
-            b += delta[5]
+            if (estimateFov) {
+                scale = (scale * (1f + delta[3].toFloat().coerceIn(-0.01f, 0.01f))).coerceIn(0.9f, 1.1f)
+                k1 = (k1 + delta[4].toFloat().coerceIn(-0.01f, 0.01f)).coerceIn(-0.3f, 0.3f)
+            }
+            a += delta[5]
+            b += delta[6]
             sigma = (1.4826f * median(res, cnt)).coerceIn(0.004f, 0.15f)
-            if (wl < 3e-6f && abs(delta[3]) < 1e-5) break
+            if (wl < 3e-6f && abs(delta[3]) < 1e-5 && abs(delta[4]) < 1e-5) break
         }
 
         // Ocena końcowa: NCC na tych samych punktach.
         var cnt = 0
         var sf = 0.0; var sc = 0.0; var sff = 0.0; var scc = 0.0; var sfc = 0.0
         val m = rot.m
+        val gEnd = if (k1 != geom.k1) geom.withLens(geom.tanX, geom.tanY, k1) else geom
         for (i in 0 until n) {
-            val p = geom.rayAt((2f * s.u[i] - 1f) * geom.tanX * scale, (1f - 2f * s.v[i]) * geom.tanY * scale)
+            val p = gEnd.rayAt((2f * s.u[i] - 1f) * geom.tanX * scale, (1f - 2f * s.v[i]) * geom.tanY * scale)
             val c = canvas.sample(
                 Vec3(
                     m[0] * p.x + m[1] * p.y + m[2] * p.z,
@@ -362,7 +391,8 @@ object Aligner {
             else -> AlignResult.Status.OK
         }
         val out = if (status == AlignResult.Status.OK) rot else init
-        return AlignResult(status, out, ncc, overlap, cnt, if (status == AlignResult.Status.OK) scale else 1f, conditioned)
+        val ok = status == AlignResult.Status.OK
+        return AlignResult(status, out, ncc, overlap, cnt, if (ok) scale else 1f, conditioned, if (ok) k1 - geom.k1 else 0f)
     }
 
     /**

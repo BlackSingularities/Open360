@@ -50,15 +50,27 @@ enum class Hint(val text: String, val warning: Boolean = false) {
  *     ostrości względem już zszytej treści, wyrównanie ekspozycji i winietowania,
  *     samokalibracja kąta widzenia – i zszycie na CPU (odniesienie) oraz GPU (obraz).
  */
-class CaptureEngine(private val settings: Settings, val tracker: OrientationTracker) {
+class CaptureEngine(
+    private val settings: Settings,
+    val tracker: OrientationTracker,
+    /** Katalog na klatki do zapisu (kolor w JPEG); null – bez globalnego dopasowania. */
+    keyframeDir: java.io.File? = null,
+) {
     private val main = Handler(Looper.getMainLooper())
 
-    // Kąt widzenia (pion telefonu): połówkowe tangensy; bazowe z danych aparatu × kalibracja.
-    @Volatile var tanX = 0.55f
-        private set
-    @Volatile var tanY = 0.73f
-        private set
+    // Kąt widzenia (pion telefonu): połówkowe tangensy z danych aparatu × samokalibracja.
+    @Volatile private var baseTanX = 0.55f
+    @Volatile private var baseTanY = 0.73f
+    private val lens = LensEstimator()
+    private var lensKey = ""
+    val tanX: Float get() = baseTanX * lens.fovScale
+    val tanY: Float get() = baseTanY * lens.fovScale
+    /** Dystorsja obiektywu z samokalibracji. */
+    val k1: Float get() = lens.k1
     private var frameShort = 1080
+
+    /** Klatki do globalnego dopasowania przy zapisie. */
+    val store = KeyframeStore(keyframeDir?.also { it.mkdirs() })
     @Volatile var timestampsRealtime = true
 
     /** Rozmiar płótna GPU (ustawia renderer). */
@@ -146,12 +158,33 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
     var onRecordingChanged: ((Boolean) -> Unit)? = null
     var onMotionWarning: (() -> Unit)? = null
 
-    fun setCamera(tanX: Float, tanY: Float, frameShort: Int) {
-        this.frameShort = frameShort
-        this.tanX = tanX
-        this.tanY = tanY
+    /**
+     * Dane aparatu. [key] identyfikuje obiektyw i tryb (aparat, powiększenie, rozdzielczość) –
+     * kalibracja zapamiętana dla tego samego klucza wraca od razu.
+     */
+    fun setCamera(tanX: Float, tanY: Float, frameShort: Int, key: String = "") {
+        synchronized(lock) {
+            this.frameShort = frameShort
+            this.baseTanX = tanX
+            this.baseTanY = tanY
+            if (key != lensKey) {
+                lensKey = key
+                val saved = settings.lensCal.split(';')
+                if (saved.size >= 4 && saved[0] == key) {
+                    lens.set(saved[1].toFloatOrNull() ?: 1f, saved[2].toFloatOrNull() ?: 0f, saved[3].toIntOrNull() ?: 0)
+                } else {
+                    lens.set(1f, 0f, 0)
+                }
+            }
+        }
         updateTargets()
         rebuildTargets()
+    }
+
+    private fun saveLens() {
+        if (lensKey.isEmpty() || lens.samples < 5) return
+        val v = "$lensKey;${lens.fovScale};${lens.k1};${lens.samples}"
+        main.post { settings.lensCal = v }
     }
 
     /** Piksele na radian, którymi naprawdę dysponujemy (mniejsze z płótna i klatki). */
@@ -184,6 +217,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             undoTargets = BooleanArray(targets.size) { targets[it].done }
             undoCount = stitched
             policy.reset()
+            store.snapshot()
         }
         glCommands += GlCommand.Snapshot
         canUndo = hasContent && undoSupported
@@ -194,6 +228,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
 
     fun pause() {
         if (!recording) return
+        saveLens()
         recording = false
         hint = Hint.PAUSED
         onRecordingChanged?.invoke(false)
@@ -209,6 +244,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             targets.forEachIndexed { i, t -> t.done = undoTargets.getOrElse(i) { false } }
             hasContentInternal = undoCount > 0
             policy.reset()
+            store.restore()
         }
         glCommands += GlCommand.Restore
         stitched = undoCount
@@ -232,6 +268,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
             vignette.reset()
             sync.reset()
             policy.reset()
+            store.clear()
             hasContentInternal = false
         }
         glCommands += GlCommand.Clear
@@ -327,7 +364,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
         var curHint: Hint
         synchronized(lock) {
             val reference = ref ?: referenceFor(r).also { ref = it }
-            geom = FrameGeom(tanX, tanY, rot, skewNs / 1e9f, wDev)
+            geom = FrameGeom(tanX, tanY, rot, skewNs / 1e9f, wDev, lens.k1)
             val gyroPose = reference * r
             devToPano = corr * gyroPose
             // Poza wskazana przez obraz (zgrubnie, potem dokładnie) – do korekty dryfu żyroskopu.
@@ -402,9 +439,12 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 // Poza najlepiej pasująca do obrazu – do pomiarów (ostrość, ekspozycja).
                 var fitPose = devToPano
                 if (hasContentInternal && fg.contrast > 0.015f) {
-                    val res = Aligner.refine(fine, samples, geom, imagePose ?: devToPano)
+                    // Samokalibracja obiektywu od kilku klatek (wcześniej brak zakładek w różnych częściach kadru).
+                    val calibrate = keyframes >= 3
+                    val res = Aligner.refine(fine, samples, geom, imagePose ?: devToPano, estimateFov = calibrate)
                     when (res.status) {
                         AlignResult.Status.OK -> {
+                            if (calibrate && res.conditioned && res.overlap > 0.35f && res.ncc > 0.8f) lens.add(res.fovScale, res.k1Delta)
                             imagePose = res.devToPano
                             fitPose = res.devToPano
                             alignedInternal = true
@@ -444,6 +484,12 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                     val pole = poleVisible(panoToCam)
                     coarse.splat(g, panoToCam, geom, photo, quality, LonLatBox.of(border, fwd, coarse.w, coarse.h, pole))
                     fine.splat(fg, panoToCam, geom, photo, quality, LonLatBox.of(border, fwd, fine.w, fine.h, pole))
+                    // Zachowanie klatki do globalnego dopasowania przy zapisie.
+                    val decision = store.decide(devToPano, geom, quality)
+                    if (decision != KeyframeStore.Decision.SKIP) {
+                        val nv = runCatching { KeyframeJpeg.nv21(image) }.getOrNull()
+                        if (nv != null) store.add(decision, devToPano, geom, quality, fg, nv, w, h, KeyframeJpeg::write)
+                    }
                     hasContentInternal = true
                     stitchedSinceCoverage++
                     keyframes++
@@ -485,6 +531,7 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 devToPano.transposed().toGl(f.panoToCam)
                 f.tanX = geom.tanX
                 f.tanY = geom.tanY
+                f.k1 = geom.k1
                 f.gain = gain
                 f.vignette = vignette.k
                 f.omega[0] = wDev.x; f.omega[1] = wDev.y; f.omega[2] = wDev.z
@@ -532,6 +579,38 @@ class CaptureEngine(private val settings: Settings, val tracker: OrientationTrac
                 }
             }
         }
+    }
+
+    /**
+     * Globalne dopasowanie zachowanych klatek i plan złożenia panoramy (wątek w tle, po
+     * zatrzymaniu zbierania). Null, gdy klatek za mało albo wynik nie jest lepszy niż na żywo –
+     * wtedy zapisujemy płótno z podglądu.
+     */
+    fun prepareGlobal(progress: (Float) -> Unit): RenderPlan? {
+        val frames: List<Keyframe>
+        val lens0: Lens
+        val vig: Float
+        synchronized(lock) {
+            frames = store.frames()
+            lens0 = Lens(tanX, tanY, lens.k1)
+            vig = vignette.k
+        }
+        if (frames.size < 2) return null
+        if (!store.awaitWrites(30_000)) return null
+        val ok = frames.filter { it.file.length() > 0 }
+        if (ok.size < 2 || ok.size < frames.size * 0.9f) return null
+        val res = GlobalAligner.optimize(ok, lens0, vig) { progress(0.75f * it) } ?: return null
+        if (!(res.rmsDeg < res.rmsBeforeDeg) || res.rmsDeg > 0.5f) return null
+        // Kalibracja z całej panoramy jest pewniejsza niż z pojedynczych klatek – ale tylko gdy
+        // scena nie miała dużej paralaksy (ta potrafi udawać inną skalę). Uśredniamy z poprzednią.
+        if (res.outlierFraction < 0.3f && res.matches > 200) {
+            synchronized(lock) {
+                val s = res.lens.tanX / baseTanX
+                lens.set(0.5f * (lens.fovScale + s), 0.5f * (lens.k1 + res.lens.k1), max(lens.samples, 20))
+            }
+            saveLens()
+        }
+        return Seams.build(ok, res, vig) { progress(0.75f + 0.25f * it) }
     }
 
     /** Renderer zużył klatkę. */
@@ -595,4 +674,6 @@ sealed class GlCommand {
     data object Snapshot : GlCommand()
     data object Restore : GlCommand()
     class Export(val export: com.blacksingularities.open360.gl.CanvasExport) : GlCommand()
+    /** Ponowne złożenie płótna z zachowanych klatek po globalnym dopasowaniu. */
+    class Repaint(val job: com.blacksingularities.open360.gl.RepaintJob) : GlCommand()
 }

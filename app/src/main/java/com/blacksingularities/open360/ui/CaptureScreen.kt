@@ -87,6 +87,7 @@ import com.blacksingularities.open360.export.PanoGeometry
 import com.blacksingularities.open360.export.PanoStore
 import com.blacksingularities.open360.gl.CanvasExport
 import com.blacksingularities.open360.gl.PanoRenderer
+import com.blacksingularities.open360.gl.RepaintJob
 import com.blacksingularities.open360.gl.ViewMode
 import com.blacksingularities.open360.gl.ViewState
 import com.blacksingularities.open360.math.PI_F
@@ -108,7 +109,7 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     val scope = rememberCoroutineScope()
 
     val tracker = remember { OrientationTracker(context) }
-    val engine = remember { CaptureEngine(settings, tracker) }
+    val engine = remember { CaptureEngine(settings, tracker, java.io.File(context.cacheDir, "keyframes")) }
     val view = remember { ViewState() }
     val renderer = remember { PanoRenderer(engine, view, settings.effectiveCanvas(4096)) }
     val camera = remember { CameraController(context, owner, engine, settings) }
@@ -123,6 +124,8 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     var confirmReset by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var saveProgress by remember { mutableFloatStateOf(0f) }
+    var saveStage by remember { mutableStateOf("") }
+    var repaintJob by remember { mutableStateOf<RepaintJob?>(null) }
     var exportJob by remember { mutableStateOf<CanvasExport?>(null) }
     var showTips by remember { mutableStateOf(!settings.tipsSeen) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -182,6 +185,9 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
         owner.lifecycle.addObserver(obs)
         onDispose {
             exportJob?.cancelled = true
+            repaintJob?.cancelled = true
+            engine.store.clear()
+            engine.store.shutdown()
             owner.lifecycle.removeObserver(obs)
             camera.shutdown()
             tracker.stop()
@@ -194,23 +200,81 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
     }
     BackHandler { if (showSettings) showSettings = false else requestClose() }
 
+    /**
+     * Zapis w trzech etapach: globalne dopasowanie zachowanych klatek (obroty, obiektyw,
+     * ekspozycja, szwy), ponowne złożenie płótna i kodowanie JPEG. Gdy dopasowanie się nie
+     * uda (za mało klatek, za mało wspólnych punktów), zapisujemy płótno z podglądu.
+     */
     fun save() {
         if (saving || !engine.hasContent) return
         engine.pause()
         val cw = engine.canvasW
         val ch = cw / 2
-        val bounds = engine.contentBounds(cw, ch) ?: return
-        val crop = PanoExporter.crop(bounds, cw, ch)
-        val job = CanvasExport(crop, engine.exportSharpen())
         saving = true
         saveProgress = 0f
-        exportJob = job
-        engine.glCommands += GlCommand.Export(job)
+        saveStage = "Dopasowanie klatek"
         scope.launch {
+            val plan = withContext(Dispatchers.Default) {
+                runCatching { engine.prepareGlobal { p -> scope.launch { saveProgress = 0.45f * p } } }
+                    .onFailure { android.util.Log.e("Open360", "global", it) }
+                    .getOrNull()
+            }
+            var bounds = engine.contentBounds(cw, ch)
+            if (plan != null) {
+                saveStage = "Składanie panoramy"
+                val job = RepaintJob(plan)
+                repaintJob = job
+                // Kopia płótna – przy błędzie składania wracamy do podglądu.
+                engine.glCommands += GlCommand.Snapshot
+                engine.glCommands += GlCommand.Repaint(job)
+                val ok = withContext(Dispatchers.IO) {
+                    val progressJob = scope.launch {
+                        while (true) {
+                            saveProgress = 0.45f + 0.25f * job.progress
+                            kotlinx.coroutines.delay(100)
+                        }
+                    }
+                    job.decodeAll()
+                    val r = job.await(120_000)
+                    progressJob.cancel()
+                    r
+                }
+                repaintJob = null
+                if (ok) {
+                    bounds = plan.contentBounds(cw, ch) ?: bounds
+                    val r = plan.result
+                    android.util.Log.i(
+                        "Open360",
+                        "global: ${plan.frames.size} kl., ${r.pairs} par, ${r.matches} pkt, rms ${r.rmsBeforeDeg}° → ${r.rmsDeg}°, " +
+                            "tanX ${r.lens.tanX}, k1 ${r.lens.k1}, odrzucone ${r.outlierFraction}",
+                    )
+                    if (r.outlierFraction > 0.4f) {
+                        Toast.makeText(
+                            context,
+                            "Bliskie przedmioty przesuwały się względem tła – następnym razem obracaj telefon wokół obiektywu, nie wokół siebie.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                } else {
+                    job.cancelled = true
+                    engine.glCommands += GlCommand.Restore
+                }
+            }
+            val b = bounds
+            if (b == null) {
+                saving = false
+                return@launch
+            }
+            saveStage = "Zapisywanie"
+            val crop = PanoExporter.crop(b, cw, ch)
+            val job = CanvasExport(crop, engine.exportSharpen())
+            exportJob = job
+            engine.glCommands += GlCommand.Export(job)
             val geo = PanoGeometry(cw, ch, crop[0], crop[1], crop[2], crop[3])
+            val base = saveProgress
             val uri = withContext(Dispatchers.IO) {
                 PanoStore.saveStreaming(context, crop[2], crop[3]) { out ->
-                    PanoExporter.encode(job, out, PanoStore.xmpPayload(geo)) { p -> scope.launch { saveProgress = p } }
+                    PanoExporter.encode(job, out, PanoStore.xmpPayload(geo)) { p -> scope.launch { saveProgress = base + (1f - base) * p } }
                 }
             }
             if (uri == null) job.cancelled = true
@@ -348,7 +412,7 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(color = Color.White)
                     Spacer(Modifier.height(14.dp))
-                    Text("Zapisywanie panoramy… ${(saveProgress * 100).roundToInt()}%", fontWeight = FontWeight.SemiBold)
+                    Text("${saveStage.ifEmpty { "Zapisywanie" }}… ${(saveProgress * 100).roundToInt()}%", fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(10.dp))
                     LinearProgressIndicator(
                         progress = { saveProgress },
@@ -356,7 +420,7 @@ fun CaptureScreen(settings: Settings, onClose: () -> Unit, onSaved: (Uri) -> Uni
                         color = Color.White,
                         trackColor = Palette.PanelHigh,
                     )
-                    Text("${engine.canvasW / 1024}K · wyostrzanie i wypełnianie dziur", fontSize = 12.sp, color = Palette.TextDim, modifier = Modifier.padding(top = 8.dp))
+                    Text("${engine.canvasW / 1024}K · dopasowanie wszystkich klatek, szwy i wyrównanie jasności", fontSize = 12.sp, color = Palette.TextDim, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }

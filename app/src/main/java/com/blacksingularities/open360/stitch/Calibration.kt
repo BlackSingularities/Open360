@@ -86,11 +86,13 @@ class SyncEstimator {
  * a bliskie przedmioty przesuwają się w kadrze bardziej niż sam obrót (paralaksa, przy ramieniu
  * 40 cm i ścianie 3 m – o ~13%). Gdyby każdą klatkę stawiać tam, gdzie wskazuje obraz, błąd
  * sumowałby się klatka po klatce i koło „zamykałoby się” po ~315°. Dlatego globalną
- * geometrię wyznacza żyroskop, a obraz:
+ * geometrię na żywo wyznacza żyroskop, a obraz:
  *  - koryguje jego powolny dryf – korekta [corr] goni pomiar najwyżej [RATE] na sekundę
  *    i nie przekracza [MAX],
- *  - dosuwa pojedynczą klatkę lokalnie najwyżej o [LOCAL] (opóźnienia, drgania),
- *    co nie przenosi się na kolejne klatki.
+ *  - dosuwa pojedynczą klatkę lokalnie najwyżej o [LOCAL] – tyle, ile realnie myli się
+ *    czujnik (opóźnienia, drgania, błąd fuzji 1–2°); szwy pasują wtedy do sąsiadów. Granica
+ *    liczona względem żyroskopu, więc nawet przy paralaksie błąd nie rośnie ponad [LOCAL].
+ * Ostateczną, spójną geometrię wszystkich klatek liczy przy zapisie [GlobalAligner].
  */
 class PoseCorrector {
     @Volatile var corr = Mat3.I
@@ -121,9 +123,48 @@ class PoseCorrector {
     }
 
     companion object {
-        val RATE = 0.15f * DEG
+        val RATE = 0.2f * DEG
         val MAX = 6f * DEG
-        val LOCAL = 0.35f * DEG
+        val LOCAL = 1.6f * DEG
+    }
+}
+
+/**
+ * Samokalibracja obiektywu: skala kąta widzenia względem danych z aparatu i dystorsja
+ * radialna k1. Każda dobrze dopasowana klatka podaje poprawkę (Gauss-Newton z silną
+ * regularyzacją), tu uśredniamy je wykładniczo – pojedyncze klatki z paralaksą albo ruchem
+ * w kadrze nie zdołają przestawić obiektywu, a kilkanaście zgodnych – tak.
+ */
+class LensEstimator {
+    /** Mnożnik tangensów kąta widzenia. */
+    @Volatile var fovScale = 1f
+        private set
+    /** Dystorsja radialna (x_u = x_d · (1 + k1·r²), r² w ułamku półprzekątnej). */
+    @Volatile var k1 = 0f
+        private set
+    /** Ile pomiarów przyjęto (pewność kalibracji). */
+    var samples = 0
+        private set
+
+    fun set(fov: Float, k: Float, n: Int = 0) {
+        fovScale = fov.coerceIn(FOV_MIN, FOV_MAX)
+        k1 = k.coerceIn(-K1_MAX, K1_MAX)
+        samples = n
+    }
+
+    /** [scaleRatio] – poprawka skali z klatki (mnożnik), [k1Delta] – poprawka k1. */
+    fun add(scaleRatio: Float, k1Delta: Float) {
+        if (scaleRatio.isNaN() || k1Delta.isNaN()) return
+        val rate = if (samples < 10) 0.35f else 0.15f
+        fovScale = (fovScale * (1f + rate * (scaleRatio - 1f).coerceIn(-0.02f, 0.02f))).coerceIn(FOV_MIN, FOV_MAX)
+        k1 = (k1 + rate * k1Delta.coerceIn(-0.03f, 0.03f)).coerceIn(-K1_MAX, K1_MAX)
+        samples++
+    }
+
+    companion object {
+        const val FOV_MIN = 0.8f
+        const val FOV_MAX = 1.25f
+        const val K1_MAX = 0.25f
     }
 }
 

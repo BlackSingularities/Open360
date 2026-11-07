@@ -175,10 +175,17 @@ class CameraController(
         val outLong = max(res.width, res.height).toFloat()
         val outShort = min(res.width, res.height).toFloat()
 
-        // Aparat z kilkoma obiektywami (logiczny) podaje listę ogniskowych – bierzemy tę
-        // najbliższą typowej głównej; faktyczną poprawia potem wynik pierwszych klatek.
+        // Aparat z kilkoma obiektywami (logiczny) podaje listę ogniskowych. Przy powiększeniu 1×
+        // bierzemy tę najbliższą zgłaszanej w wynikach klatek. Przy innym powiększeniu (np. 0,6×
+        // – obiektyw szerokokątny) kąt widzenia to kąt obiektywu głównego / powiększenie: wtedy
+        // ogniskowa z wyników należy już do innego obiektywu (innej matrycy) i nie wolno jej
+        // łączyć z rozmiarem matrycy aparatu logicznego – wychodziłby kąt kilkakrotnie za duży.
         val focals = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-        val focal = focals?.minByOrNull { abs(it - (lastFocal ?: 5f)) } ?: 4.3f
+        val focal = if (ratio == 1f) {
+            focals?.minByOrNull { abs(it - (lastFocal ?: 5f)) } ?: 4.3f
+        } else {
+            focals?.firstOrNull() ?: 4.3f
+        }
         val phys = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val pixel = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
         val active = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
@@ -213,7 +220,8 @@ class CameraController(
             manualExposure = manualSensor,
         )
         info = i
-        engine.setCamera(tShort, tLong, outShort.toInt())
+        lensKey = "${c2.cameraId}|$ratio|${outLong.toInt()}x${outShort.toInt()}"
+        engine.setCamera(tShort, tLong, outShort.toInt(), lensKey)
         lastFocal?.let { checkFocal(it) }
         onInfo?.invoke(i)
         setLocked(false)
@@ -226,6 +234,7 @@ class CameraController(
     private var outShortPx = 1080f
     private var zoomRatio = 1f
     private var usedFocal = 0f
+    private var lensKey = ""
     @Volatile private var lastFocal: Float? = null
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
@@ -241,6 +250,8 @@ class CameraController(
     /** Ogniskowa z wyniku klatki różni się od przyjętej – przeliczamy kąt widzenia. */
     private fun checkFocal(f: Float) {
         val cur = info ?: return
+        // Przy powiększeniu ≠ 1× wynik podaje ogniskową innego obiektywu (zob. bind) – ignorujemy.
+        if (zoomRatio != 1f) return
         if (usedFocal <= 0f || abs(f - usedFocal) / usedFocal < 0.02f) return
         usedFocal = f
         val (tShort, tLong) = tangents(f)
@@ -251,7 +262,7 @@ class CameraController(
             fovV = Math.toDegrees(2.0 * kotlin.math.atan(tLong.toDouble())).toFloat(),
         )
         info = i
-        engine.setCamera(tShort, tLong, cur.frameW)
+        engine.setCamera(tShort, tLong, cur.frameW, lensKey)
         onInfo?.invoke(i)
     }
 
