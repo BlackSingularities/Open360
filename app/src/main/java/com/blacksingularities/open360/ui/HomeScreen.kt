@@ -52,11 +52,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.blacksingularities.open360.R
 import com.blacksingularities.open360.data.Settings
 import com.blacksingularities.open360.export.PanoItem
 import com.blacksingularities.open360.export.PanoStore
@@ -114,8 +112,6 @@ fun HomeScreen(
     ) {
         item {
             Row(Modifier.statusBarsPadding().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Image(painterResource(R.drawable.brand_monochrome), null, Modifier.size(44.dp))
-                Spacer(Modifier.width(8.dp))
                 Text("Open360", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 if (picking) {
                     RoundButton(Icons.Outlined.Close, "Anuluj", background = Color.Transparent) { onCancel() }
@@ -125,25 +121,11 @@ fun HomeScreen(
             }
         }
         item {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(Palette.PanelHigh)
-                    .padding(20.dp),
-            ) {
-                Text(if (picking) "Wybierz panoramę" else "Panorama 360° na żywo", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    if (picking) {
-                        "Dotknij zapisanej panoramy, aby ją przesłać, albo zrób nową – po zapisaniu trafi od razu do aplikacji, która prosi o plik."
-                    } else {
-                        "Wodź telefonem – sfera wypełnia się na ekranie w czasie rzeczywistym. " +
-                            "Pełna sfera, pas horyzontu albo dowolny fragment."
-                    },
-                    color = Palette.TextDim, fontSize = 14.sp,
-                )
-                Spacer(Modifier.height(16.dp))
+            Column(Modifier.padding(top = 12.dp, bottom = 8.dp)) {
+                if (picking) {
+                    Text("Wybierz panoramę albo zrób nową.", color = Palette.TextDim, fontSize = 14.sp)
+                    Spacer(Modifier.height(12.dp))
+                }
                 PrimaryButton("Nowa panorama", Icons.Outlined.CameraAlt, Modifier.fillMaxWidth()) { onCapture() }
                 if (!picking) {
                     Spacer(Modifier.height(10.dp))
@@ -206,13 +188,13 @@ fun HomeScreen(
             }
         }
         item {
-            Text("Twoje panoramy", fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+            Text("Twoje panoramy", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Palette.TextDim, modifier = Modifier.padding(top = 8.dp, start = 4.dp))
         }
         val list = items
         if (list != null && list.isEmpty()) {
             item {
                 Text(
-                    "Tu pojawią się zapisane panoramy (folder Zdjęcia › Open360).",
+                    "Brak zapisanych panoram.",
                     color = Palette.TextDim, fontSize = 14.sp,
                 )
             }

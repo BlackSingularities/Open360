@@ -1,5 +1,9 @@
 # Zmiany
 
+## 2.2.5
+
+- Minimalistyczny ekran główny: tytuł, przyciski „Nowa panorama” i „Otwórz zdjęcie 360°” oraz lista panoram – bez dużego panelu z opisem.
+
 ## 2.2.4
 
 - Bez żadnych wzmianek o GitHubie w aplikacji: nowy adres serwera aktualizacji, komunikaty błędów bez nazw zewnętrznych serwerów.
