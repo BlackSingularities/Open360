@@ -1,0 +1,22 @@
+{
+  "slug": "open360",
+  "name": "Open360",
+  "label": "panoramy sferyczne 360°",
+  "icon": "icon.png",
+  "url": "https://redzikowski.com/portfolio/open360",
+  "posters": [
+    {
+      "platform": "android",
+      "file": "android.png",
+      "title": "Cała sfera *w jednym zdjęciu*",
+      "lead": "Wodzisz telefonem, a panorama 360° składa się na ekranie na żywo. Potem oglądasz ją jako perspektywę, małą planetę albo tunel.",
+      "shots": [
+        { "src": "../screenshots/android/02-perspektywa.png", "caption": "Perspektywa" },
+        { "src": "../screenshots/android/03-mala-planeta.png", "caption": "Mała planeta" },
+        { "src": "../screenshots/android/04-tunel.png", "caption": "Tunel" }
+      ],
+      "features": ["zszywanie na GPU na żywo", "płótno od 2K do 16K", "odrzucanie rozmazanych klatek", "metadane GPano", "eksport JPEG"],
+      "meta": "Android 10 lub nowszy"
+    }
+  ]
+}
